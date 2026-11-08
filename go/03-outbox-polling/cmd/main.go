@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"time"
 
@@ -25,7 +26,7 @@ func main() {
 	defer cancel()
 
 	// 별도 스키마(go_03)를 써서 04(Debezium, public.outbox)와 테이블 구조가 충돌하지 않게 한다.
-	dsn := getenv("DATABASE_URL", "postgres://lab:lab@localhost:15432/lab?sslmode=disable") + "&search_path=go_03"
+	dsn := withSearchPath(getenv("DATABASE_URL", "postgres://lab:lab@localhost:15432/lab?sslmode=disable"), "go_03")
 	brokers := getenv("KAFKA_BROKERS", "localhost:19092")
 	topic := outboxpolling.TopicPaymentEvents + ".go03" // 04 의 Debezium 토픽(payment.events)과 섞이지 않게
 
@@ -99,4 +100,19 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// withSearchPath 는 DSN 에 search_path 를 붙인다.
+// 문자열에 "&search_path=" 를 그냥 이어 붙이면 DATABASE_URL 에
+// "?" 가 없을 때(예: postgres://u:p@h/db) 잘못된 DSN 이 된다
+// → net/url 로 파싱해서 쿼리 파라미터로 넣는다.
+func withSearchPath(dsn, schema string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		log.Fatalf("DATABASE_URL 파싱 실패: %v", err)
+	}
+	q := u.Query() // url.Values = map[string][]string
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
