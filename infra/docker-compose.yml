@@ -1,0 +1,37 @@
+# 로컬 실습용 인프라. 단계별 테스트는 Testcontainers로 자동 기동되므로
+# 이 compose는 앱을 직접 띄워보거나 04-outbox-cdc(Debezium)를 실습할 때 사용한다.
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]   # Debezium CDC를 위해 logical replication 활성화
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+    ports: ["15432:5432"]
+
+  redpanda:   # Kafka API 호환 브로커 (JVM/ZooKeeper 없이 가볍게)
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp 1
+      - --memory 512M
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092"]
+
+  connect:    # Debezium (Kafka Connect) — 04-outbox-cdc 전용
+    image: quay.io/debezium/connect:2.7
+    depends_on: [postgres, redpanda]
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      GROUP_ID: debezium
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    ports: ["8083:8083"]
+    profiles: ["cdc"]

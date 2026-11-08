@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: outbox-cdc
+  # infra/docker-compose.yml 의 Postgres (wal_level=logical). Debezium이 이 DB의 WAL을 읽는다.
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always

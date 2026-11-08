@@ -1,0 +1,15 @@
+# Kotlin / Gradle
+.gradle/
+build/
+out/
+*.class
+.idea/
+*.iml
+.kotlin/
+
+# Go
+go/bin/
+*.test
+coverage.out
+
+.DS_Store

@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: dual-write-problem
+  # 수동 실행용 기본값 (infra/docker-compose.yml). 테스트에서는 Testcontainers가 덮어쓴다.
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always
+  kafka:
+    bootstrap-servers: localhost:19092
+    producer:
+      acks: all   # 모든 replica가 받았을 때만 성공으로 본다
+
+lab:
+  topic: payment.events

@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: idempotent-consumer
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always
+  kafka:
+    bootstrap-servers: localhost:19092
+    consumer:
+      # 자동 커밋을 끈다: 자동 커밋은 "처리 완료"와 무관하게 주기적으로 offset을 커밋하므로,
+      # 처리 전에 커밋돼 버리면 죽었을 때 메시지가 유실된다. DB 커밋 후 우리가 직접 커밋한다.
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+
+lab:
+  topic: payment.events
+  consumer:
+    enabled: true            # 테스트에서는 false로 끄고 ConsumerLoop를 직접 돌린다
+    group-id: point-service

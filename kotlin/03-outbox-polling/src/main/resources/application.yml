@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: outbox-polling
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always
+  kafka:
+    bootstrap-servers: localhost:19092
+    producer:
+      acks: all   # 모든 replica가 받았을 때만 "발행 성공" → 그 다음에야 published_at을 찍는다
+
+lab:
+  topic: payment.events
+  outbox:
+    relay:
+      enabled: true       # 테스트에서는 false로 끄고 relayOnce()를 직접 호출한다
+      interval-ms: 500
+      batch-size: 100

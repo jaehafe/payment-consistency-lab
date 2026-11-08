@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: idempotency-key
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always
+
+lab:
+  idempotency:
+    # 잠금이 이 시간보다 오래되면 "처리하던 서버가 죽었다"고 보고 다른 요청이 이어받을 수 있다.
+    lock-timeout: 30s
