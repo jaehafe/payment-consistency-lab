@@ -44,6 +44,7 @@ class IdempotencyKeyTest {
         assertEquals(201, first.statusCode.value())
         assertEquals(201, second.statusCode.value())
         assertEquals(json(first.body), json(second.body), "두 번째는 저장된 첫 응답을 그대로 재생한다")
+        assertEquals(first.body, second.body, "바이트 단위까지 같다 (첫 응답도 jsonb에 저장된 바디를 돌려줌)")
         assertEquals(1, pg.chargeCount(), "실제 승인은 한 번")
         assertEquals(1, pg.callCount(), "두 번째 요청은 PG를 호출조차 하지 않는다 (finished → 저장된 응답)")
     }

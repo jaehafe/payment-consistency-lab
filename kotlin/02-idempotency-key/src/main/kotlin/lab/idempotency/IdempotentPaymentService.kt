@@ -59,8 +59,8 @@ class IdempotentPaymentService(
             // ---- Phase 3 (tx): 응답 저장 + finished + 잠금 해제 ----
             return tx.execute {
                 val body = objectMapper.writeValueAsString(payments.findByOrderId(request.orderId))
-                keys.finish(idempotencyKey, 201, body)
-                StoredResponse(201, body)
+                // 재생(replay)될 응답과 바이트 단위까지 같도록, 저장된(jsonb 정규화된) 바디를 그대로 돌려준다.
+                StoredResponse(201, keys.finish(idempotencyKey, 201, body))
             }!!
         } catch (e: PaymentGatewayException) {
             // PG 에러/타임아웃은 "재시도 가능한 에러"다. 잠금을 풀어 두면 클라이언트가 같은 key로 바로 재시도할 수 있고,

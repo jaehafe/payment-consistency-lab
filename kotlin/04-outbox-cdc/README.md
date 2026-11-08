@@ -21,6 +21,8 @@ Postgres는 모든 커밋을 WAL(Write-Ahead Log)에 기록한다. `wal_level=lo
 | `type` | 헤더 `event_type` | `table.fields.additional.placement` |
 | `payload` | value (JSON 그대로) | `table.expand.json.payload=true` |
 
+> 실제 메시지에는 헤더 `id`도 하나 더 붙는다 (Event Router가 기본으로 넣는 이벤트 id, `message_id`와 같은 값). 컨슈머는 `message_id`를 쓰면 된다.
+
 `published_at` 컬럼이 없다는 점에 주목. "어디까지 보냈는지"는 Debezium이 WAL 위치(LSN)를 Kafka에 offset으로 저장해서 추적한다.
 
 ## 핵심 코드 위치

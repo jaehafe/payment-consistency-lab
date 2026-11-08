@@ -107,7 +107,7 @@ Prometheus `http://localhost:9090/alerts`에서 알림 상태, Graph 탭에서 �
 재현: `curl -X POST localhost:8090/admin/pg-faults -H 'Content-Type: application/json' -d '{"timeoutAfterCharge": true}'`
 (Fake PG는 승인한 뒤 응답을 안 주고, 호출 쪽은 `timeoutMs`(기본 5초, `"timeoutMs": 3500`처럼 바꿀 수 있음)만큼 기다리다 타임아웃을 본다. 복구: `{"timeoutAfterCharge": false}`)
 
-1. **알림** (뜨는 순서): 먼저 `PaymentUnknownPiling` (`payment_unknown_current > 10`, `for: 2m`). 위의 트래픽 루프는 요청을 하나씩 보내므로 타임아웃 동안 5초에 1건으로 느려져 10건을 넘기까지 약 1분, 거기에 2분 → 약 3분 뒤. 그다음 약 5분 뒤 `PaymentFailureRateHigh` (failed+unknown 비율 > 5%, `for: 5m`)와 `PgLatencyHigh` (타임아웃 호출이 5초씩 걸려 p99 ≈ 5s > 3s, `for: 5m`)가 거의 함께 뜬다. 정확한 시각은 트래픽량에 따라 달라지지만 `for`가 짧은 Piling이 먼저다. 타임아웃을 3초 이하로 줄이면 `PgLatencyHigh`는 안 뜬다.
+1. **알림** (뜨는 순서): 먼저 `PaymentUnknownPiling` (`payment_unknown_current > 10`, `for: 2m`). 위의 트래픽 루프는 요청을 하나씩 보내므로 타임아웃 동안 5초에 1건으로 느려져 10건을 넘기까지 약 1분, 거기에 2분 → 약 3분 뒤. 그다음 약 5분 뒤 `PaymentFailureRateHigh` (failed+unknown 비율 > 5%, `for: 5m`)와 `PgLatencyHigh` (타임아웃 호출이 5초씩 걸려 p99 ≈ 5s > 3s, `for: 5m`)가 거의 함께 뜬다. 정확한 시각은 트래픽량과 Prometheus 규칙 평가 주기(`evaluation_interval`, 기본 1m — 각 단계가 최대 1분씩 늦어진다)에 따라 달라지지만 `for`가 짧은 Piling이 먼저다 (e2e 실측: Piling firing ≈ 4~5분, 나머지 둘 ≈ 7분). 타임아웃을 3초 이하로 줄이면 `PgLatencyHigh`는 안 뜬다.
 2. **메트릭/PromQL**:
    ```promql
    payment_unknown_current                                            # 계속 오르기만 하면 janitor가 확정을 못 하는 중
@@ -126,10 +126,12 @@ Prometheus `http://localhost:9090/alerts`에서 알림 상태, Graph 탭에서 �
 
 재현: 같은 키로 반복 요청
 ```bash
-KEY=$(uuidgen); for i in $(seq 1 500); do
+KEY=$(uuidgen); end=$((SECONDS + 240)); while (( SECONDS < end )); do   # 4분 동안 계속
   curl -s -o /dev/null -X POST localhost:8090/payments -H 'Content-Type: application/json' \
-    -H "Idempotency-Key: $KEY" -d '{"orderId":"order-storm","amount":10000}'; done
+    -H "Idempotency-Key: $KEY" -d '{"orderId":"order-storm","amount":10000}'; sleep 0.05; done
 ```
+> 횟수(예: 500번)로 끊으면 로컬에선 15초 안에 끝나 `rate[1m] > 5`가 2분을 못 버틴다 → pending만 되고 firing은 안 된다.
+> 시간으로 돌려야 한다. Prometheus `evaluation_interval`이 기본 1m이라 실제로는 시작 후 약 3분 뒤 firing (e2e 실측 185초).
 
 1. **알림**: `DuplicateRequestStorm` (`idempotency_replays_total` 초당 > 5, 2분 지속).
 2. **메트릭/PromQL**:

@@ -61,7 +61,7 @@ go test ./02-idempotency-key/ -v
 ### 직접 띄워보기
 
 ```bash
-docker compose -f ../infra/docker-compose.yml up -d postgres
+docker compose -f infra/docker-compose.yml up -d postgres   # 레포 루트에서
 cd go && go run ./02-idempotency-key/cmd     # :8081 (PORT 로 변경 가능), 스키마 go_02 사용
 curl -i -X POST localhost:8081/payments -H 'Idempotency-Key: k1' -H 'Content-Type: application/json' \
   -d '{"orderId":"o-1","amount":10000}'

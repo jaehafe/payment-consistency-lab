@@ -106,7 +106,7 @@ Prometheus `http://localhost:9090/alerts` 에서 알림 상태, Grafana 에서 �
 
 재현: `curl -X POST 'localhost:8091/admin/faults?hang=true'` (복구: `hang=false`)
 
-1. **알림** (뜨는 순서): 먼저 `PaymentUnknownPiling` (`payment_unknown_current > 10`, `for: 2m`). 위 트래픽 루프는 요청을 하나씩 보내므로 타임아웃(5s) 동안 5초에 1건으로 느려져 10건을 넘기까지 약 1분, 거기에 2분 → 약 3분 뒤. 그다음 약 5분 뒤 `PaymentFailureRateHigh` (failed+unknown 비율 > 5%, `for: 5m`)와 `PgLatencyHigh` (p99 ≈ 타임아웃 5s > 3s, `for: 5m`)가 거의 함께 뜬다.
+1. **알림** (뜨는 순서): 먼저 `PaymentUnknownPiling` (`payment_unknown_current > 10`, `for: 2m`). 위 트래픽 루프는 요청을 하나씩 보내므로 타임아웃(5s) 동안 5초에 1건으로 느려져 10건을 넘기까지 약 1분, 거기에 2분 → 약 3분 뒤. 그다음 약 5분 뒤 `PaymentFailureRateHigh` (failed+unknown 비율 > 5%, `for: 5m`)와 `PgLatencyHigh` (p99 ≈ 타임아웃 5s > 3s, `for: 5m`)가 거의 함께 뜬다. Prometheus 규칙 평가 주기(`evaluation_interval`, 기본 1m)만큼 각 단계가 늦어질 수 있다 (e2e 실측: Piling firing ≈ 4~5분, 나머지 둘 ≈ 7분).
 2. **메트릭**:
    ```promql
    sum(rate(payment_requests_total{result="unknown"}[5m])) / sum(rate(payment_requests_total[5m]))   # UNKNOWN 비율
@@ -127,9 +127,11 @@ Prometheus `http://localhost:9090/alerts` 에서 알림 상태, Grafana 에서 �
 
 재현: 같은 key 로 반복 요청
 ```bash
-for i in $(seq 1 500); do curl -s -o /dev/null -X POST localhost:8091/payments -H 'Idempotency-Key: storm-1' \
-  -d '{"orderId":"o-storm","amount":10000}'; done
+end=$((SECONDS + 240)); while (( SECONDS < end )); do curl -s -o /dev/null -X POST localhost:8091/payments -H 'Idempotency-Key: storm-1' \
+  -d '{"orderId":"o-storm","amount":10000}'; sleep 0.05; done      # 4분 동안 계속
 ```
+> 횟수(예: 500번)로 끊으면 로컬에선 15초 안에 끝나 `rate[1m] > 5` 가 2분을 못 버틴다 → pending 만 되고 firing 은 안 된다.
+> 시간으로 돌려야 한다. Prometheus `evaluation_interval` 이 기본 1m 이라 실제로는 시작 후 약 3분 뒤 firing (e2e 실측 185초).
 
 1. **알림**: `DuplicateRequestStorm` (`rate(idempotency_replays_total[1m]) > 5`, 2분).
 2. **메트릭**:

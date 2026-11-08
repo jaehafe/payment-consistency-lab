@@ -19,6 +19,8 @@ outbox INSERT 를 감지하면 Kafka 로 보낸다. 테이블 컬럼은 Debezium
 | `type` | 헤더 `event_type` |
 | `payload` | 메시지 value (JSON 그대로, `expand.json.payload`) |
 
+> 실제 메시지에는 헤더 `id` 도 하나 더 붙는다 (Event Router 가 기본으로 넣는 이벤트 id, `message_id` 와 같은 값). 컨슈머는 `message_id` 를 쓰면 된다.
+
 WAL 에는 **커밋된** 변경만 나타나므로 롤백된 결제의 이벤트는 절대 나가지 않는다.
 
 ## 핵심 코드 위치

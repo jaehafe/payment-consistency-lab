@@ -79,14 +79,19 @@ class IdempotencyKeyRepository(private val jdbc: JdbcTemplate) {
         )
     }
 
-    fun finish(key: String, code: Int, body: String) {
-        jdbc.update(
+    /**
+     * @return 저장된 응답 바디 (jsonb가 정규화한 텍스트).
+     * jsonb는 키 순서/공백을 바꿔 저장하므로, 첫 응답도 이 값을 돌려줘야 재시도 응답과 바이트 단위까지 같다.
+     */
+    fun finish(key: String, code: Int, body: String): String =
+        jdbc.queryForObject(
             """
             UPDATE idempotency_keys
             SET recovery_point = 'finished', response_code = ?, response_body = ?::jsonb, locked_at = NULL
             WHERE idempotency_key = ?
+            RETURNING response_body::text
             """.trimIndent(),
+            String::class.java,
             code, body, key,
-        )
-    }
+        )!!
 }

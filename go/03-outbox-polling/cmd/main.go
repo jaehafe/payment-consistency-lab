@@ -48,23 +48,31 @@ func main() {
 	go relay.Run(ctx, time.Second, 100)
 
 	svc := &outboxpolling.PaymentService{DB: db, Gateway: outboxpolling.NewFakePaymentGateway()}
+	mine := map[string]bool{} // 이번 실행이 만든 주문 (= Kafka key)
 	for i := 0; i < 3; i++ {
 		p, err := svc.Pay(ctx, fmt.Sprintf("order-%d", time.Now().UnixNano()), 10000)
 		must(err)
+		mine[p.OrderID] = true
 		log.Printf("결제 저장 (+outbox): paymentId=%s orderId=%s", p.ID, p.OrderID)
 	}
 
-	// 컨슈머: 토픽 끝에서 3건을 기다린다.
+	// 컨슈머: 이번에 만든 3건이 토픽에 나타날 때까지 기다린다.
+	// "끝에서 3건"(AtEnd().Relative(-3))으로 읽으면, 토픽에 이전 실행의 메시지가 있을 때 릴레이가 아직
+	// 이번 결제를 보내기도 전에 옛 메시지 3건을 받고 끝나 버린다. 그래서 처음부터 읽되 key 로 골라낸다.
 	consumer, err := kgo.NewClient(kgo.SeedBrokers(brokers), kgo.ConsumeTopics(topic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd().Relative(-3)))
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
 	must(err)
 	defer consumer.Close()
-	for got := 0; got < 3; {
+	for want, got := len(mine), 0; got < want; {
 		fetches := consumer.PollFetches(ctx)
 		if ctx.Err() != nil {
 			log.Fatal("timeout: 메시지를 받지 못함")
 		}
 		fetches.EachRecord(func(r *kgo.Record) {
+			if !mine[string(r.Key)] {
+				return
+			}
+			delete(mine, string(r.Key)) // 재발행(at-least-once)으로 같은 key 가 또 와도 한 번만 센다
 			got++
 			log.Printf("수신 key=%s headers=%s value=%s", r.Key, fmtHeaders(r.Headers), r.Value)
 		})

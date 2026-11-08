@@ -53,7 +53,7 @@ go test ./03-outbox-polling/ -v
 ### 직접 띄워보기
 
 ```bash
-docker compose -f ../infra/docker-compose.yml up -d postgres redpanda
+docker compose -f infra/docker-compose.yml up -d postgres redpanda   # 레포 루트에서
 cd go && go run ./03-outbox-polling/cmd   # 스키마 go_03, 토픽 payment.events.go03 사용 (04 의 Debezium 토픽과 분리)
 ```
 
