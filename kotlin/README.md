@@ -12,8 +12,13 @@ Go 구현(`../go/`)과 같은 테스트 이름을 쓰므로 나란히 놓고 비
 | [`03-outbox-polling`](03-outbox-polling/README.md) | `lab.outbox.polling` | Transactional Outbox + Polling Relay | 원자적 저장, 장애 후 전달, SKIP LOCKED, at-least-once |
 | [`04-outbox-cdc`](04-outbox-cdc/README.md) | `lab.outbox.cdc` | Outbox + Debezium CDC | outbox 행 형식 (E2E는 수동 절차) |
 | [`05-idempotent-consumer`](05-idempotent-consumer/README.md) | `lab.consumer` | 멱등 컨슈머 | 중복 메시지/크래시 재전송에도 처리 1번 |
+| [`06-balance-concurrency`](06-balance-concurrency/README.md) | `lab.balance` | 잔액 동시성 (5가지 전략 + 이체 데드락) | 나이브 이중 지불, 각 전략 1건만 성공, 40P01 |
+| [`07-payment-state-machine`](07-payment-state-machine/README.md) | `lab.statemachine` | 상태 머신 · UNKNOWN · 보상 · janitor | CAS 전이, 타임아웃 확정, MANUAL_REVIEW, PG 취소 보상 |
+| [`08-ledger-settlement`](08-ledger-settlement/README.md) | `lab.ledger` | 복식부기 원장 · 수수료 · 정산 · 지급 | 차변=대변, 반올림, KST 경계, 시산표 0 |
+| [`09-reconciliation`](09-reconciliation/README.md) | `lab.recon` | PG 정산 파일 대사 | 누락/중복/금액 차이 탐지, 같은 파일 재import 무시 |
+| [`10-observability`](10-observability/README.md) | `lab.observability` | 구조화 로그 · Prometheus 메트릭 · 런북 | request_id 전파, 결과/지연/UNKNOWN/재요청 메트릭 |
 
-읽는 순서는 01 → 05. 각 모듈은 혼자 읽어도 이해되도록 Fake PG, 이벤트 DTO 같은 작은 코드를 공유 모듈 없이 **일부러 복사**해 두었다.
+읽는 순서는 01 → 10. (01~05: 메시지 정합성, 06~10: 돈 계산과 운영) 각 모듈은 혼자 읽어도 이해되도록 Fake PG, 이벤트 DTO 같은 작은 코드를 공유 모듈 없이 **일부러 복사**해 두었다.
 
 ## 실행
 
@@ -29,7 +34,7 @@ cd kotlin
 테스트 리포트: `<모듈>/build/reports/tests/test/index.html`
 
 앱을 직접 띄워 보려면 `../infra/docker-compose.yml`로 Postgres(localhost:15432)와 Redpanda(localhost:19092)를 띄운 뒤
-`./gradlew :<모듈>:bootRun`. (예: `02-idempotency-key`는 8080 포트에 `POST /payments`)
+`./gradlew :<모듈>:bootRun`. (예: `02-idempotency-key`는 8080 포트에 `POST /payments`, `10-observability`는 8090 포트 + `/actuator/prometheus`)
 
 ```bash
 curl -i -X POST localhost:8080/payments \

@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: ledger-settlement
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always
+
+lab:
+  fee-rate-bps: 300   # 3% (bps = 1/10000). 비율도 정수로 들고 다닌다

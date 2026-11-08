@@ -1,0 +1,9 @@
+pg_tx_id,order_id,type,amount,fee,transacted_at
+tx-ok-1,order-1,PAYMENT,10000,300,2026-11-07T01:00:00Z
+tx-ok-2,order-2,PAYMENT,20000,600,2026-11-07T02:00:00Z
+tx-mismatch,order-3,PAYMENT,29000,870,2026-11-07T03:00:00Z
+tx-missing-internal,order-6,PAYMENT,12000,360,2026-11-07T04:00:00Z
+tx-dup-pg,order-7,PAYMENT,7000,210,2026-11-07T05:00:00Z
+tx-dup-pg,order-7,PAYMENT,7000,210,2026-11-07T05:00:00Z
+tx-dup-internal,order-5,PAYMENT,5000,150,2026-11-07T06:00:00Z
+tx-next-day,order-8,PAYMENT,9000,270,2026-11-07T15:30:00Z

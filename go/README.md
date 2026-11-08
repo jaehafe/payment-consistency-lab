@@ -29,8 +29,14 @@ go test ./02-idempotency-key/ -v -run Test_concurrent_same_key__only_one_charge 
 | `03-outbox-polling` | `outboxpolling` | Transactional Outbox + `SKIP LOCKED` 폴링 릴레이 | `payment_service.go`, `outbox_relay.go`, `cmd/main.go` |
 | `04-outbox-cdc` | `outboxcdc` | Debezium Outbox Event Router 용 outbox | `payment_service.go`, `cmd/main.go` |
 | `05-idempotent-consumer` | `idempotentconsumer` | `processed_messages` 기반 멱등 컨슈머 | `consumer.go` |
+| `06-balance-concurrency` | `balance` | 잔액 동시성 5전략 + 정렬 잠금 이체 (데드락 `40P01` 재현) | `withdraw.go`, `transfer.go` |
+| `07-payment-state-machine` | `statemachine` | 상태 머신, UNKNOWN + janitor, MANUAL_REVIEW, 보상(PG 취소) | `state.go`, `payment_service.go`, `janitor.go`, `orchestrator.go` |
+| `08-ledger-settlement` | `ledger` | 복식부기 원장, HALF_UP 수수료, KST 일 정산, 지급, 시산표 | `ledger.go`, `transactions.go`, `settlement.go`, `report.go` |
+| `09-reconciliation` | `recon` | PG 정산 CSV import + 대사 SQL(누락/중복/금액차) + 리포트 | `recon_queries.sql`, `importer.go`, `service.go` |
+| `10-observability` | `observability` | slog JSON 로그(request_id 전파), Prometheus 메트릭, 런북 | `logging.go`, `metrics.go`, `server.go`, `cmd/main.go` |
 
 각 단계 공통: `schema.sql`(`//go:embed` 로 `schema.go` 에 포함), `*_test.go`(테스트), `infra_test.go`(Testcontainers 기동), `README.md`.
+01/03/05 는 Postgres + Redpanda, 02/04/06~10 은 Postgres 만 띄운다.
 
 디렉토리 이름에는 `-` 와 숫자가 들어가서 Go 식별자가 될 수 없으므로 패키지 이름은 따로 짓는다.
 import 할 때는 별칭을 붙인다: `outboxpolling "github.com/jaehafe/payment-consistency-lab/go/03-outbox-polling"`.
@@ -43,14 +49,17 @@ import 할 때는 별칭을 붙인다: `outboxpolling "github.com/jaehafe/paymen
 | Kafka | `github.com/twmb/franz-go` (`kgo`, `kadm`) |
 | 테스트 인프라 | `github.com/testcontainers/testcontainers-go` + `modules/postgres`, `modules/redpanda` |
 | HTTP | 표준 라이브러리 `net/http` (Go 1.22+ 라우팅 패턴 `"POST /payments"`) |
+| 메트릭 (10) | `github.com/prometheus/client_golang` (`prometheus`, `promhttp`, `testutil`), `github.com/prometheus/client_model` |
+| 로그 (10) | 표준 라이브러리 `log/slog` (JSON 핸들러) |
 
 ### 수동 실행 (`infra/docker-compose.yml`)
 
 - `go run ./02-idempotency-key/cmd` — `:8081` HTTP 서버 (스키마 `go_02`)
 - `go run ./03-outbox-polling/cmd` — 결제 3건 → 릴레이 → 수신 출력 (스키마 `go_03`, 토픽 `payment.events.go03`)
 - `go run ./04-outbox-cdc/cmd` — Debezium E2E (스키마 `public`, 토픽 `payment.events`). 절차는 `04-outbox-cdc/README.md`
+- `go run ./10-observability/cmd` — `:8091` 결제 서버 + `/metrics` + `/admin/faults` (스키마 `go_10`). `--profile obs` 의 Prometheus 가 스크레이프. 런북은 `10-observability/README.md`
 
-02/03 이 별도 스키마를 쓰는 이유: 같은 DB 에서 03 의 `outbox`(폴링용 컬럼)와 04 의 `outbox`(Debezium 컬럼)가 충돌하지 않게, 그리고 Kotlin 앱과 테이블이 섞이지 않게.
+02/03/10 이 별도 스키마를 쓰는 이유: 같은 DB 에서 03 의 `outbox`(폴링용 컬럼)와 04 의 `outbox`(Debezium 컬럼)가 충돌하지 않게, 그리고 Kotlin 앱과 테이블이 섞이지 않게.
 환경 변수 `DATABASE_URL`(기본 `postgres://lab:lab@localhost:15432/lab?sslmode=disable`), `KAFKA_BROKERS`(기본 `localhost:19092`)로 바꿀 수 있다.
 
 ---
@@ -85,6 +94,24 @@ import 할 때는 별칭을 붙인다: `outboxpolling "github.com/jaehafe/paymen
 | `//go:embed schema.sql` | `resources/` 파일 읽기 | 컴파일 시 파일을 변수에 박아 넣음 |
 | `_` | `_` (안 쓰는 값) | `_, err := f()` |
 | `xs...` | `*array` (spread) | 슬라이스를 가변 인자로 펼침 |
+| `func f[T any](x T) T` | `fun <T> f(x: T): T` | 제네릭 (Go 1.18+) |
+| `for i := range 10 {}` | `for (i in 0 until 10)` | 정수 range (Go 1.22+) |
+| `type Status string` | `@JvmInline value class Status(val v: String)` | 기존 타입 기반의 새 타입. 상수와 함께 enum 처럼 쓴다 |
+| `v, ok := x.(*T)` | `val v = x as? T` | 타입 단언. `any`(= `interface{}`)에서 구체 타입 꺼내기 |
+| `errors.As(err, &pgErr)` | `(e.cause as? PSQLException)?.sqlState` | 감싼 에러 체인에서 **타입**으로 찾아 꺼냄. `errors.Is` 는 **값** 비교 |
+| `*pgconn.PgError` `.Code` | `PSQLException.sqlState` | Postgres SQLSTATE (`40001` 직렬화 실패, `40P01` 데드락, `23505` UNIQUE 위반) |
+| `atomic.Int64` / `atomic.Bool` | `AtomicLong` / `AtomicBoolean` | `sync/atomic`. 잠금 없이 goroutine 간 안전한 카운터/플래그 |
+| `type A struct { B }` (임베딩) | `class A(b: B) : B by b` | B 의 메서드를 A 가 그대로 물려받음. 일부만 다시 정의(데코레이터) |
+| `context.WithValue(ctx, key{}, v)` | MDC / `CoroutineContext` 요소 | ctx 에 값을 얹은 **새** ctx. 키는 패키지 전용 타입으로 (충돌 방지) |
+| `slog.InfoContext(ctx, "msg", "k", v)` | `log.info("msg", kv("k", v))` + MDC | 구조화 로그. ctx 를 넘겨야 핸들러가 ctx 필드를 붙일 수 있다 |
+| `func(next http.Handler) http.Handler` | `OncePerRequestFilter` | HTTP 미들웨어의 모양. `http.HandlerFunc(f)` 로 함수를 Handler 로 |
+| `prometheus.NewRegistry()` | `new PrometheusMeterRegistry(...)` | 전역 대신 전용 레지스트리 → 테스트 격리 |
+| `time.LoadLocation("Asia/Seoul")` | `ZoneId.of("Asia/Seoul")` | `_ "time/tzdata"` import 로 타임존 DB 를 바이너리에 포함 |
+| `t.Format("2006-01-02")` | `DateTimeFormatter.ofPattern("yyyy-MM-dd")` | Go 날짜 포맷은 기준 시각 `2006-01-02 15:04:05` 로 쓴다 |
+| `csv.NewReader(r).Read()` | OpenCSV `readNext()` | `encoding/csv`. 끝이면 `io.EOF` 에러 |
+| `strconv.ParseInt(s, 10, 64)` | `s.toLong()` | 실패 시 에러 반환 (예외 아님) |
+| `pgx.CollectRows(rows, pgx.RowToStructByPos[T])` | `jdbcTemplate.query(sql, rowMapper)` | 행 → 구조체 슬라이스 |
+| `tx.CopyFrom(...)` | `batchUpdate` (더 빠름) | Postgres COPY 프로토콜 대량 insert |
 
 ### pgx 트랜잭션 패턴 (모든 단계에서 반복)
 

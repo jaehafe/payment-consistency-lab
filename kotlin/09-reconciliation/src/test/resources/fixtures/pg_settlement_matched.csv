@@ -1,0 +1,4 @@
+pg_tx_id,order_id,type,amount,fee,transacted_at
+tx-ok-1,order-1,PAYMENT,10000,300,2026-11-07T01:00:00Z
+tx-ok-2,order-2,PAYMENT,20000,600,2026-11-07T02:00:00Z
+tx-refund-1,order-1,REFUND,3000,90,2026-11-07T08:00:00Z

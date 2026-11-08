@@ -15,6 +15,11 @@
 | 03 | Transactional Outbox (Polling) | 01의 dual write | 결제와 이벤트를 **한 트랜잭션**에 저장 → relay가 `FOR UPDATE SKIP LOCKED`로 발행 | [kotlin/03](kotlin/03-outbox-polling) | [go/03](go/03-outbox-polling) |
 | 04 | Transactional Outbox (CDC) | polling의 지연·DB 부하 | Debezium Outbox Event Router가 WAL을 읽어 발행 | [kotlin/04](kotlin/04-outbox-cdc) | [go/04](go/04-outbox-cdc) |
 | 05 | 멱등 컨슈머 | outbox는 at-least-once → 메시지 중복 수신 | `processed_messages` 를 같은 트랜잭션에 기록, DB 커밋 후 offset 커밋 | [kotlin/05](kotlin/05-idempotent-consumer) | [go/05](go/05-idempotent-consumer) |
+| 06 | 잔액 동시성 | 동시 인출 → lost update, 이중지불 / 이체 데드락 | 비관적·낙관적 락, `SERIALIZABLE`, 조건부 UPDATE 비교 / 잠금 순서 정렬 | [kotlin/06](kotlin/06-balance-concurrency) | [go/06](go/06-balance-concurrency) |
+| 07 | 결제 상태 머신 | PG 타임아웃 = 성공인지 실패인지 모름, 후속 단계 실패 | `UNKNOWN` 상태 + janitor 재조회·백오프 → `MANUAL_REVIEW` 보류 / PG 취소 보상 | [kotlin/07](kotlin/07-payment-state-machine) | [go/07](go/07-payment-state-machine) |
+| 08 | 원장·정산 | 입금·출금·수수료·환불 금액 추적, 정산 중복 | 복식부기 원장(차변=대변, 원장 멱등성), KST 거래일 정산, 시산표 | [kotlin/08](kotlin/08-ledger-settlement) | [go/08](go/08-ledger-settlement) |
+| 09 | 대사 | PG 정산 파일 ↔ 내부 거래 불일치 | `FULL OUTER JOIN` / `HAVING count(*) > 1` 대사 SQL, 리포트 | [kotlin/09](kotlin/09-reconciliation) | [go/09](go/09-reconciliation) |
+| 10 | 관측성 | 장애 시 원인 파악 불가 | request_id 구조화 로그, Prometheus 메트릭·알림, 시나리오별 런북 | [kotlin/10](kotlin/10-observability) | [go/10](go/10-observability) |
 
 각 단계 README: **문제 → 해결 → 핵심 코드 위치 → 테스트 실행법 → 한계/다음 단계**.
 두 구현이 지키는 공통 계약(스키마, 테스트 이름)은 [docs/SPEC.md](docs/SPEC.md).
@@ -25,6 +30,11 @@
 - **02** 같은 키로 10개 동시 요청 → PG 승인 1회 (201 ×1, 409 ×9) / PG 승인 후 응답 유실 → 재시도해도 승인 1회
 - **03** relay 2개 동시 실행 → 각 이벤트 정확히 1번 발행 (SKIP LOCKED 제거 시 테스트 실패) / 발행 후 마킹 전 크래시 → 같은 `message_id` 2번 발행 (at-least-once)
 - **05** 나이브 컨슈머는 중복 메시지에 포인트 2배 적립 / 멱등 컨슈머는 offset 커밋 전 크래시 후 재전달돼도 skip
+- **06** 잔액 1,000원 계좌에 1,000원 인출 10건 동시 → 나이브는 10건 모두 성공(이중지불), 나머지 전략은 정확히 1건 / 잠금 순서 미정렬 이체는 실제 데드락(`40P01`)
+- **07** 10개 동시 확정 시도 중 1개만 승리 / UNKNOWN → janitor가 PG 조회로 확정, 백오프 초과 시 MANUAL_REVIEW / 재고 실패 시 PG 취소 보상, 취소 실패도 재시도
+- **08** 차변=대변 강제, 같은 거래 두 번 전기 불가, 수수료 원 단위 반올림, UTC 15:30 거래는 KST 다음날 정산, 시산표 합계 0
+- **09** 누락(양방향)·금액 차이·중복(양방향) 5종 탐지, 같은 파일 재import 무시, 차액 합계 리포트
+- **10** 한 요청의 모든 로그에 같은 request_id / PG 타임아웃 시 UNKNOWN 메트릭 증가 / 중복 요청 시 replay 메트릭 증가
 
 ## 실행
 
@@ -47,11 +57,17 @@ docker compose -f infra/docker-compose.yml --profile cdc up -d
 # 이후 각 04 README 절차대로 앱 실행 → payment.events 토픽 확인
 ```
 
+10(관측성) 실습:
+```bash
+docker compose -f infra/docker-compose.yml --profile obs up -d   # Prometheus :9090, Grafana :3000 (admin/admin)
+# Kotlin 앱 :8090, Go 앱 :8091 실행 후 각 10 README의 런북대로 장애 주입
+```
+
 ## 레포 구조
 
 ```
 docs/SPEC.md          두 구현의 공통 계약
-infra/                docker-compose (Postgres wal_level=logical, Redpanda, Debezium Connect), 커넥터 설정
+infra/                docker-compose (Postgres wal_level=logical, Redpanda, Debezium Connect, Prometheus, Grafana), 커넥터·알림 설정
 kotlin/               Gradle 멀티모듈, Spring Boot 3.5 + Kotlin 2.2, JdbcTemplate (ORM 없이 트랜잭션 경계 노출)
 go/                   단일 Go 모듈, pgx/v5 + franz-go (Kotlin 개발자용 Go 문법 주석 포함)
 ```
@@ -67,15 +83,18 @@ go/                   단일 Go 모듈, pgx/v5 + franz-go (Kotlin 개발자용 G
 | [debezium/debezium-examples](https://github.com/debezium/debezium-examples) (`outbox`) | 04 — CDC outbox |
 | [gruelbox/transaction-outbox](https://github.com/gruelbox/transaction-outbox) | 03 — 작고 읽기 쉬운 outbox 라이브러리 |
 | [spring-projects/spring-modulith](https://github.com/spring-projects/spring-modulith) | 03 — Event Publication Registry |
-| [killbill/killbill](https://github.com/killbill/killbill) | (다음 단계) 결제 상태 머신, janitor |
+| [killbill/killbill](https://github.com/killbill/killbill) | 07 — 결제 상태 머신, `payment/core/janitor` |
+| [eventuate-tram/eventuate-tram-sagas](https://github.com/eventuate-tram/eventuate-tram-sagas) | 07 — 보상 트랜잭션(saga) |
+| [blnkfinance/blnk](https://github.com/blnkfinance/blnk) | 06, 08, 09 — 원장, 잔액, 대사(`api/reconciliation_api.go`) |
+| [formancehq/ledger](https://github.com/formancehq/ledger) | 08 — 프로그래머블 원장 |
+| [tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle) | 06, 08 — 금융 거래 전용 DB (복식부기·잔액 제약을 DB 레벨로) |
 | [juspay/hyperswitch](https://github.com/juspay/hyperswitch) | 실제 결제 스위치 전체 구조 |
 
 개념 자료: [microservices.io — Transactional Outbox](https://microservices.io/patterns/data/transactional-outbox.html), [Idempotent Consumer](https://microservices.io/patterns/communication-style/idempotent-consumer.html), Brandur — *Implementing Stripe-like Idempotency Keys in Postgres*, Chris Richardson — *Microservices Patterns* 3~4장.
 
-## 다음 단계 (예정)
+## 알려진 한계
 
-- 06 잔액 동시성 — 비관적/낙관적 락, `SERIALIZABLE`, 이중지불 재현
-- 07 결제 상태 머신 — `PENDING → UNKNOWN → CONFIRMED/FAILED`, janitor 재처리, 보상
-- 08 원장·정산 — 입금/출금/수수료 복식부기, 일별 정산
-- 09 대사 — PG 거래내역 ↔ 내부 원장, 누락·중복·금액 차이 탐지 SQL
-- 10 관측성 — 구조화 로그, 메트릭, 장애 주입
+- 04 Debezium E2E는 자동 테스트 없이 README의 수동 절차만 제공 (아직 실제 Debezium으로 검증하지 않음)
+- 07 크래시로 `PENDING`에 멈춘 결제는 janitor 대상이 아님 (각 README 한계 항목 참고)
+- 08 PG 수수료 비용 계정 없이 단순화 (PG가 총액에서 환불만 차감해 입금한다고 가정)
+- 각 단계는 독립 실행 가능하도록 일부 코드(Fake PG 등)를 의도적으로 중복

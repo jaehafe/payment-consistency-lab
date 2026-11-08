@@ -1,0 +1,30 @@
+# 10-observability 런북과 짝을 이루는 알림 규칙 예시
+groups:
+  - name: payment
+    rules:
+      - alert: PaymentUnknownPiling
+        expr: payment_unknown_current > 10
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "UNKNOWN 결제가 쌓이는 중 — PG 타임아웃 또는 janitor 정지 의심"
+      - alert: PgLatencyHigh
+        expr: histogram_quantile(0.99, sum by (le, job) (rate(pg_call_duration_seconds_bucket[5m]))) > 3
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "PG 호출 p99 > 3s"
+      - alert: PaymentFailureRateHigh
+        expr: |
+          sum by (job) (rate(payment_requests_total{result=~"failed|unknown"}[5m]))
+            / sum by (job) (rate(payment_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "결제 실패+UNKNOWN 비율 > 5%"
+      - alert: DuplicateRequestStorm
+        expr: sum by (job) (rate(idempotency_replays_total[1m])) > 5
+        for: 2m
+        labels: { severity: warn }
+        annotations:
+          summary: "멱등키 재요청 급증 — 클라이언트 재시도 폭주 의심"

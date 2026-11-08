@@ -152,3 +152,237 @@ CREATE TABLE processed_messages (
 - 주석·README는 한국어. "왜 이렇게 하는가"를 주석으로 남긴다.
 - Go 코드는 사용자가 Go 문법에 익숙하지 않으므로 처음 등장하는 문법(에러 처리, defer, goroutine, context, 구조체 메서드, 인터페이스 등)에 짧은 설명 주석을 단다.
 - 각 단계 디렉토리에 `README.md`: 문제 → 해결 → 핵심 코드 위치 → 테스트 실행법 → 한계/다음 단계.
+
+---
+
+# Part 2 — 06~10단계
+
+공통 규칙은 Part 1과 같다 (ORM 없이 SQL, Testcontainers, 한국어 주석, Go 문법 주석, 단계별 README).
+**금액은 항상 정수(원, BIGINT/Long/int64)** — 부동소수점 금지.
+
+## 06-balance-concurrency — 잔액 동시성 제어
+
+스키마:
+```sql
+CREATE TABLE accounts (
+  id       TEXT PRIMARY KEY,
+  balance  BIGINT NOT NULL,          -- 의도적으로 CHECK(balance >= 0) 없음: 나이브 구현의 초과 인출을 보이기 위해
+  version  BIGINT NOT NULL DEFAULT 0
+);
+CREATE TABLE withdrawals (
+  id          BIGSERIAL PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  amount      BIGINT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+`withdraw(accountId, amount) -> success/insufficient` 를 5가지 전략으로 구현 (성공 시 withdrawals에 1행):
+- `NaiveWithdraw`: READ COMMITTED에서 SELECT로 읽고 → 앱에서 검사 → `UPDATE SET balance = <읽은 값 - amount>`. 읽기와 쓰기 사이 지연 주입 가능(레이스를 결정적으로 재현).
+- `PessimisticWithdraw`: `SELECT ... FOR UPDATE`.
+- `OptimisticWithdraw`: `UPDATE ... SET balance=?, version=version+1 WHERE id=? AND version=?`, 0행이면 재시도(최대 N회).
+- `SerializableWithdraw`: `SERIALIZABLE` 격리 수준, SQLSTATE `40001` 이면 재시도.
+- `ConditionalUpdateWithdraw`: `UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?` 한 문장 (실무에서 가장 흔한 답).
+- `transfer(from, to, amount)`: 두 계좌를 **id 순서로** 잠가 데드락 방지.
+
+테스트 (잔액 1,000 계좌에 1,000원 인출 10건 동시 요청 등):
+- `naive__concurrent_withdrawals__double_spending` (성공 >1 → 이중지불, 잔액과 withdrawals 합계 불일치)
+- `pessimistic__concurrent_withdrawals__exactly_one_succeeds`
+- `optimistic__concurrent_withdrawals__exactly_one_succeeds_with_retries`
+- `serializable__concurrent_withdrawals__exactly_one_succeeds_with_retries`
+- `conditional_update__concurrent_withdrawals__exactly_one_succeeds`
+- `transfer__opposite_directions_concurrently__no_deadlock` (A→B, B→A 동시 다수, 총액 보존)
+- `transfer__unordered_locking__deadlock_detected` (잠금 순서 미정렬 버전은 Postgres `40P01` 발생을 보여줌)
+
+README에 전략 비교표: 정합성 / 처리량 / 재시도 필요 / 언제 쓰나.
+
+## 07-payment-state-machine — 상태 머신 · 보류 · 보상 · 재처리
+
+스키마:
+```sql
+CREATE TABLE payments (
+  id              UUID PRIMARY KEY,
+  order_id        TEXT NOT NULL UNIQUE,
+  amount          BIGINT NOT NULL,
+  status          TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,   -- PG 호출용
+  pg_tx_id        TEXT,
+  attempt_count   INT NOT NULL DEFAULT 0, -- janitor 확인 시도 횟수
+  next_retry_at   TIMESTAMPTZ,
+  last_error      TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE payment_status_history (
+  id          BIGSERIAL PRIMARY KEY,
+  payment_id  UUID NOT NULL,
+  from_status TEXT,
+  to_status   TEXT NOT NULL,
+  reason      TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+상태: `REQUESTED → PENDING → APPROVED | FAILED | UNKNOWN`, `UNKNOWN → APPROVED | FAILED | MANUAL_REVIEW`, `APPROVED → CANCEL_REQUESTED → CANCELED`.
+- 허용 전이표를 코드에 명시, 그 외 전이는 예외.
+- 전이는 `UPDATE ... SET status=? WHERE id=? AND status=?` (compare-and-set) + history insert 를 한 트랜잭션에서.
+- Fake PG: `charge(key, orderId, amount)`, `getStatus(key) -> APPROVED|FAILED|NOT_FOUND`, `cancel(pgTxId)`. 실패 주입: timeoutAfterCharge, timeoutBeforeCharge(요청이 PG에 도달 못함), failCancel.
+- PG 타임아웃 → `UNKNOWN` (실패로 단정하지 않는다! 승인됐을 수 있음).
+- `Janitor.reconcileUnknown(now)`: `UNKNOWN AND next_retry_at <= now` 를 `FOR UPDATE SKIP LOCKED`로 집어 PG 조회 → APPROVED/FAILED 확정. NOT_FOUND는 일정 시간 지나면 FAILED. 지수 백오프로 `next_retry_at` 갱신, `maxAttempts` 초과 시 `MANUAL_REVIEW`(보류, 사람 확인).
+- `CheckoutOrchestrator.checkout(order)`: 결제 승인 → 후속 단계(재고 확보 `InventoryClient.reserve`) 실패 시 **보상**: PG 취소 → `CANCELED`. 취소 실패 시 `CANCEL_REQUESTED`로 남기고 janitor가 재시도.
+
+테스트:
+- `invalid_transition__rejected`
+- `every_transition_recorded_in_history`
+- `concurrent_transition__only_one_wins`
+- `pg_timeout_after_charge__unknown__janitor_confirms_approved`
+- `pg_timeout_before_charge__unknown__janitor_marks_failed`
+- `unknown_exceeds_max_attempts__moved_to_manual_review`
+- `downstream_failure__compensated_by_pg_cancel`
+- `cancel_failure__left_cancel_requested__janitor_retries_cancel`
+
+README에 상태 다이어그램(mermaid)과 운영 쿼리(상태별 건수, 오래된 UNKNOWN, MANUAL_REVIEW 목록).
+
+## 08-ledger-settlement — 입금·출금·수수료·정산 (복식부기 원장)
+
+스키마:
+```sql
+CREATE TABLE ledger_accounts (
+  id       TEXT PRIMARY KEY,         -- 'pg:receivable', 'bank:cash', 'platform:fee_revenue', 'merchant:{id}:payable'
+  type     TEXT NOT NULL,            -- ASSET | LIABILITY | REVENUE
+  balance  BIGINT NOT NULL DEFAULT 0 -- 차변 +, 대변 - (부호 규칙: debit-positive)
+);
+CREATE TABLE journal_entries (
+  id              UUID PRIMARY KEY,
+  reference_type  TEXT NOT NULL,     -- PAYMENT | REFUND | PG_DEPOSIT | PAYOUT
+  reference_id    TEXT NOT NULL,
+  description     TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (reference_type, reference_id)   -- 같은 거래 두 번 전기 방지 (원장 멱등성)
+);
+CREATE TABLE ledger_lines (
+  id          BIGSERIAL PRIMARY KEY,
+  entry_id    UUID NOT NULL REFERENCES journal_entries(id),
+  account_id  TEXT NOT NULL REFERENCES ledger_accounts(id),
+  debit       BIGINT NOT NULL DEFAULT 0,
+  credit      BIGINT NOT NULL DEFAULT 0,
+  CHECK (debit >= 0 AND credit >= 0 AND (debit = 0) <> (credit = 0))
+);
+CREATE TABLE transactions (            -- 결제/환불 원천 거래
+  id             UUID PRIMARY KEY,
+  merchant_id    TEXT NOT NULL,
+  type           TEXT NOT NULL,        -- PAYMENT | REFUND
+  pg_tx_id       TEXT NOT NULL,
+  amount         BIGINT NOT NULL,      -- 항상 양수
+  fee            BIGINT NOT NULL,      -- 환불은 수수료 환급(음수 아님, 별도 표시)
+  occurred_at    TIMESTAMPTZ NOT NULL,
+  settlement_id  UUID
+);
+CREATE TABLE settlements (
+  id               UUID PRIMARY KEY,
+  merchant_id      TEXT NOT NULL,
+  settlement_date  DATE NOT NULL,      -- KST 기준 거래일
+  gross_amount     BIGINT NOT NULL,
+  refund_amount    BIGINT NOT NULL,
+  fee_amount       BIGINT NOT NULL,    -- 순수수료 (결제 수수료 - 환불 수수료 환급)
+  net_amount       BIGINT NOT NULL,    -- gross - refund - fee
+  status           TEXT NOT NULL,      -- CALCULATED | PAID
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (merchant_id, settlement_date)
+);
+```
+- 수수료: `fee = (amount * rateBps + 5000) / 10000` (원 단위 HALF_UP), 기본 rateBps=300 (3%).
+- 분개:
+  - 결제 승인: Dr `pg:receivable` amount / Cr `merchant:{id}:payable` amount-fee / Cr `platform:fee_revenue` fee
+  - 환불: 결제 분개의 역분개
+  - PG 정산금 입금: Dr `bank:cash` / Cr `pg:receivable`
+  - 가맹점 지급(출금): Dr `merchant:{id}:payable` / Cr `bank:cash` → settlement `PAID`
+- `LedgerService.post(entry)`: 차변 합 ≠ 대변 합이면 거부. ledger_lines insert + balance 갱신을 한 트랜잭션.
+- `SettlementService.settle(date)`: KST 거래일의 미정산 transactions 를 가맹점별 집계 → settlements 생성 + transactions.settlement_id 갱신. 같은 날짜 재실행해도 중복 없음.
+- `ReportQueries.dailyReport(date)`: 가맹점별 gross/refund/fee/net, 그리고 시산표(trial balance).
+
+테스트:
+- `payment_posting__debits_equal_credits`
+- `unbalanced_entry__rejected`
+- `fee_rounding__half_up_in_won`
+- `same_reference_posted_twice__single_entry`
+- `refund__reverses_payment_entries`
+- `settle__net_equals_gross_minus_refund_minus_fee`
+- `settle__uses_kst_day_boundary` (UTC 15:30 = 다음날 KST 00:30 → 다음날 정산)
+- `settle_twice_same_date__no_duplicate_settlement`
+- `payout__merchant_payable_zero_after_payout`
+- `trial_balance__sum_of_balances_is_zero`
+
+## 09-reconciliation — 대사 (누락·중복·금액 차이)
+
+스키마 (+ 08의 transactions 간소화 버전 사용 가능):
+```sql
+CREATE TABLE internal_transactions (
+  id          UUID PRIMARY KEY,
+  pg_tx_id    TEXT NOT NULL,           -- 의도적으로 UNIQUE 아님: 내부 중복도 탐지 대상
+  order_id    TEXT NOT NULL,
+  type        TEXT NOT NULL,           -- PAYMENT | REFUND
+  amount      BIGINT NOT NULL,
+  occurred_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE recon_files (             -- PG 정산 파일 import 이력 (같은 파일 두 번 import 방지)
+  id         BIGSERIAL PRIMARY KEY,
+  file_name  TEXT NOT NULL,
+  file_hash  TEXT NOT NULL UNIQUE,     -- SHA-256
+  row_count  INT NOT NULL,
+  imported_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE pg_settlement_records (
+  id          BIGSERIAL PRIMARY KEY,
+  file_id     BIGINT NOT NULL REFERENCES recon_files(id),
+  pg_tx_id    TEXT NOT NULL,
+  order_id    TEXT NOT NULL,
+  type        TEXT NOT NULL,
+  amount      BIGINT NOT NULL,
+  fee         BIGINT NOT NULL,
+  transacted_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE recon_results (
+  id              BIGSERIAL PRIMARY KEY,
+  run_id          UUID NOT NULL,
+  business_date   DATE NOT NULL,
+  kind            TEXT NOT NULL,   -- MISSING_IN_INTERNAL | MISSING_IN_PG | AMOUNT_MISMATCH | DUPLICATE_IN_PG | DUPLICATE_IN_INTERNAL
+  pg_tx_id        TEXT NOT NULL,
+  internal_amount BIGINT,
+  pg_amount       BIGINT,
+  diff_amount     BIGINT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+- PG 정산 파일 CSV 헤더: `pg_tx_id,order_id,type,amount,fee,transacted_at` (테스트 fixture로 제공).
+- 대사 SQL은 **별도 .sql 파일**(`recon_queries.sql`)에 이름 붙여 모아 둔다 — 사용자가 SQL만 따로 읽고 DB에서 직접 실행해볼 수 있게. 기법: `FULL OUTER JOIN ... ON pg_tx_id` (누락/금액차), `GROUP BY ... HAVING count(*) > 1` (중복). 대상 기간은 KST business_date.
+- `ReconciliationService.run(businessDate)`: 결과를 recon_results 에 저장, `ReconReport` (종류별 건수, 차액 합계, 일치 건수) 반환 + Markdown 리포트 문자열 생성.
+
+테스트:
+- `matched_records__no_discrepancy`
+- `missing_in_internal__detected`
+- `missing_in_pg__detected`
+- `amount_mismatch__detected_with_diff`
+- `duplicate_in_pg_file__detected`
+- `duplicate_internal__detected`
+- `same_file_imported_twice__ignored`
+- `report__summarizes_counts_and_diff_amount`
+
+## 10-observability — 로그 · 메트릭 · 장애 시나리오
+
+07의 결제 흐름을 간소화해 재사용 (PG 호출 + UNKNOWN 처리 + 멱등키 재요청) 하고 관측성을 붙인다.
+- **구조화 로그(JSON)**: 모든 로그에 `request_id`, `payment_id`, `order_id`, `idempotency_key`(있으면). `X-Request-Id` 헤더를 받아(없으면 생성) 요청 전체에 전파. Kotlin: Spring Boot 구조화 로깅(`logging.structured.format.console`) + MDC, Go: `log/slog` JSON 핸들러 + context.
+- **메트릭(Prometheus)**:
+  - `payment_requests_total{result="approved|failed|unknown|replayed|conflict"}`
+  - `pg_call_duration_seconds` (histogram)
+  - `payment_unknown_current` (gauge, UNKNOWN 상태 결제 수)
+  - `idempotency_replays_total`
+  Kotlin: Micrometer + actuator `/actuator/prometheus`, 포트 8090. Go: `prometheus/client_golang`, `/metrics`, 포트 8091.
+- **장애 시나리오** (Fake PG 실패 주입): PG 지연 급증, PG 타임아웃 급증, 중복 요청 폭주.
+- `infra/` 에 Prometheus(+ alert rules), Grafana 가 `obs` 프로필로 준비되어 있다 (`infra/observability/`).
+- README에 **런북**: 시나리오별 "어떤 알림이 뜨고 → 어떤 메트릭/PromQL을 보고 → 어떤 로그를 request_id로 grep 해서 → 원인 판단".
+
+테스트:
+- `request_id_propagated_to_all_logs` (로그 캡처해서 같은 request_id 확인)
+- `pg_timeout__unknown_counter_and_gauge_increase`
+- `duplicate_requests__replay_metric_increments`
+- `pg_latency__histogram_records_duration`
+- `metrics_endpoint_exposes_payment_metrics`

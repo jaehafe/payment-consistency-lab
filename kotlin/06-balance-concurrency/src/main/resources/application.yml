@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: balance-concurrency
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+    hikari:
+      # 동시 요청 10건이 각자 커넥션을 잡고 진짜로 경합하도록 풀을 넉넉히 둔다.
+      # (풀이 작으면 요청들이 커넥션 대기로 직렬화되어 레이스가 가려진다)
+      maximum-pool-size: 30
+  sql:
+    init:
+      mode: always

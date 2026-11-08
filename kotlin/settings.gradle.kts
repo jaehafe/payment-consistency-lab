@@ -7,4 +7,9 @@ include(
     "03-outbox-polling",
     "04-outbox-cdc",
     "05-idempotent-consumer",
+    "06-balance-concurrency",
+    "07-payment-state-machine",
+    "08-ledger-settlement",
+    "09-reconciliation",
+    "10-observability",
 )

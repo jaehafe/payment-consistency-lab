@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: payment-state-machine
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always
+
+lab:
+  janitor:
+    max-attempts: 5          # 이만큼 확인해도 확정 못 하면 MANUAL_REVIEW (사람이 확인)
+    base-backoff: 10s        # 10s, 20s, 40s, 80s ... 지수 백오프
+    not-found-grace: 5m      # PG에 기록이 없어도 이 시간 동안은 FAILED로 단정하지 않는다
+    lease: 1m                # 집어 간 행을 다른 janitor가 다시 집지 않도록 미뤄 두는 시간

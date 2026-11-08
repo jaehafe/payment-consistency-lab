@@ -35,3 +35,20 @@ services:
       STATUS_STORAGE_REPLICATION_FACTOR: 1
     ports: ["8083:8083"]
     profiles: ["cdc"]
+
+  prometheus:   # 10-observability 전용
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["9090:9090"]
+    profiles: ["obs"]
+
+  grafana:      # 10-observability 전용 (admin/admin)
+    image: grafana/grafana:11.2.2
+    depends_on: [prometheus]
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports: ["3000:3000"]
+    profiles: ["obs"]

@@ -1,0 +1,29 @@
+server:
+  port: 8090   # infra/observability/prometheus.yml 이 host.docker.internal:8090/actuator/prometheus 를 긁는다
+
+spring:
+  application:
+    name: observability
+  datasource:
+    url: jdbc:postgresql://localhost:15432/lab
+    username: lab
+    password: lab
+  sql:
+    init:
+      mode: always
+
+logging:
+  structured:
+    format:
+      # 콘솔 로그를 한 줄 JSON으로. MDC 값(request_id, payment_id, order_id, idempotency_key)이 최상위 필드로 들어간다.
+      # → 로그 수집기(Loki/ELK)에서 필드로 검색하거나, 로컬에선 jq로 거른다.
+      console: logstash
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
