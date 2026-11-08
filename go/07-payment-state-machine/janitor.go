@@ -3,6 +3,7 @@ package statemachine
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 )
 
 // Janitor 는 "결과를 모르는" 결제(UNKNOWN)와 "취소가 덜 끝난" 결제(CANCEL_REQUESTED)를 주기적으로 정리한다.
-// 실제로는 cron / @Scheduled 로 1분마다 돌린다. 테스트에서는 now 를 직접 넘겨 시간을 조종한다.
+// 앱에서는 Run(ctx, interval) 이 주기 실행한다 (cmd/main.go). 테스트에서는 now 를 직접 넘겨 시간을 조종한다.
 type Janitor struct {
 	DB      *pgxpool.Pool
 	Gateway *FakePaymentGateway
@@ -224,4 +225,57 @@ func (j *Janitor) batchSize() int {
 		return 100
 	}
 	return j.BatchSize
+}
+
+// Run 은 ctx 가 취소될 때까지 janitor 를 주기 실행한다.
+// Kotlin 의 @Scheduled(fixedDelay = ...) 에 해당한다.
+//
+// fixed delay: "한 번 다 돌고 난 시점부터" interval 을 쉰다
+// (03 OutboxRelay.Run 과 같은 방식). killbill 은
+// scheduleAtFixedRate(시작 시각 기준)를 쓰지만, 여기선
+// 한 바퀴가 PG 조회 때문에 느려져도 다음 바퀴가 바로 붙어
+// 실행되지 않게 delay 를 고른다. 어차피 처리 대상은
+// next_retry_at 으로 정해지므로 정확한 주기는 중요하지 않다.
+//
+// 에러가 나도 루프는 멈추지 않는다: 로그만 남기고 다음 주기에
+// 다시 시도한다. (Spring 도 @Scheduled 메서드의 예외를 로그로
+// 남기고 다음 실행을 계속한다)
+func (j *Janitor) Run(ctx context.Context, interval time.Duration) {
+	for {
+		// 이미 취소됐으면 DB 를 건드리지 않고 바로 끝낸다
+		if ctx.Err() != nil {
+			return
+		}
+		j.runOnce(ctx, time.Now())
+		// select: 먼저 준비되는 채널 쪽을 실행 (Kotlin 의 select { })
+		select {
+		case <-ctx.Done(): // 종료 신호 (cancel() / SIGTERM)
+			return
+		case <-time.After(interval): // 다 돈 시점부터 interval 뒤
+		}
+	}
+}
+
+// runOnce 는 한 바퀴: UNKNOWN 확정 → 취소 재시도.
+// 한쪽이 실패해도 다른 쪽은 실행한다 (서로 독립적인 작업).
+func (j *Janitor) runOnce(ctx context.Context, now time.Time) {
+	u, uerr := j.ReconcileUnknown(ctx, now)
+	if uerr != nil && ctx.Err() == nil {
+		log.Printf("janitor: reconcile unknown 실패"+
+			" (다음 주기에 재시도): %v", uerr)
+	}
+	c, cerr := j.RetryCancels(ctx, now)
+	if cerr != nil && ctx.Err() == nil {
+		log.Printf("janitor: retry cancels 실패"+
+			" (다음 주기에 재시도): %v", cerr)
+	}
+	// 실행 요약. 할 일이 없던 바퀴는 조용히 넘어간다
+	// (Go 표준 log 에는 DEBUG 레벨이 없다).
+	if u != (JanitorStats{}) || c != (JanitorStats{}) {
+		log.Printf("janitor run: unknown{approved=%d failed=%d"+
+			" manualReview=%d rescheduled=%d}"+
+			" cancel{canceled=%d rescheduled=%d}",
+			u.Approved, u.Failed, u.ManualReview, u.Rescheduled,
+			c.Canceled, c.Rescheduled)
+	}
 }

@@ -76,7 +76,11 @@ class FakePaymentGateway : PaymentGateway {
     override fun cancel(pgTxId: String) {
         if (failCancel) throw PgException("PG 장애 주입: 취소 실패")
         onCancel?.invoke(pgTxId)
-        val r = records.values.first { it.pgTxId == pgTxId }
+        // 모르는 거래면 PG 오류로 응답한다 (실제 PG도 오류 코드로 답한다).
+        // first { } 의 NoSuchElementException 은 PgException 이 아니라
+        // janitor 배치를 통째로 멈췄다.
+        val r = records.values.firstOrNull { it.pgTxId == pgTxId }
+            ?: throw PgException("PG: 알 수 없는 pgTxId $pgTxId")
         if (!r.canceled) {
             r.canceled = true
             cancelCount.incrementAndGet()

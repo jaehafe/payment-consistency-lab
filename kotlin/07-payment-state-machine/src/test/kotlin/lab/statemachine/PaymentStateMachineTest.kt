@@ -16,7 +16,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-@SpringBootTest
+// janitor를 시각(now)을 넘겨 직접 호출하므로 스케줄러는 끈다 (결정적 테스트)
+@SpringBootTest(properties = ["lab.janitor.enabled=false"])
 @Import(TestcontainersConfiguration::class)
 class PaymentStateMachineTest {
     @Autowired lateinit var paymentService: PaymentService
@@ -231,6 +232,26 @@ class PaymentStateMachineTest {
         assertEquals(PaymentStatus.CANCELED, payments.find(first.id).status)
         assertEquals(PaymentStatus.CANCELED, payments.find(second.id).status)
         assertEquals(2, pg.cancelCount())
+    }
+
+    @Test
+    fun cancel_retry__pg_unknown_tx__rescheduled_rest_of_batch_processed() {
+        inventory.failReserve = true
+        pg.failCancel = true
+        val bad = checkout.checkout(newOrderId(), 10_000, "SKU-1")
+        val good = checkout.checkout(newOrderId(), 10_000, "SKU-1")
+        pg.failCancel = false
+        // PG가 모르는 거래 id (데이터 이관 실수, 다른 PG 계정 등) → PG 오류로 다뤄 재시도·백오프해야 한다
+        jdbc.update("UPDATE payments SET pg_tx_id = 'pg_unknown' WHERE id = ?", bad.id)
+
+        val picked = janitor.retryCancelRequested(Instant.now().plus(Duration.ofHours(1)))
+
+        assertEquals(2, picked)
+        // 모르는 거래 하나 때문에 배치 나머지가 멈추면 안 된다
+        assertEquals(PaymentStatus.CANCELED, payments.find(good.id).status)
+        val after = payments.find(bad.id)
+        assertEquals(PaymentStatus.CANCEL_REQUESTED, after.status)
+        assertTrue(after.attemptCount >= 1)
     }
 
     @Test

@@ -30,7 +30,7 @@ go test ./02-idempotency-key/ -v -run Test_concurrent_same_key__only_one_charge 
 | `04-outbox-cdc` | `outboxcdc` | Debezium Outbox Event Router 용 outbox | `payment_service.go`, `cmd/main.go` |
 | `05-idempotent-consumer` | `idempotentconsumer` | `processed_messages` 기반 멱등 컨슈머 | `consumer.go` |
 | `06-balance-concurrency` | `balance` | 잔액 동시성 5전략 + 정렬 잠금 이체 (데드락 `40P01` 재현) | `withdraw.go`, `transfer.go` |
-| `07-payment-state-machine` | `statemachine` | 상태 머신, UNKNOWN + janitor, MANUAL_REVIEW, 보상(PG 취소) | `state.go`, `payment_service.go`, `janitor.go`, `orchestrator.go` |
+| `07-payment-state-machine` | `statemachine` | 상태 머신, UNKNOWN + janitor, MANUAL_REVIEW, 보상(PG 취소) | `state.go`, `payment_service.go`, `janitor.go`, `orchestrator.go`, `cmd/main.go` |
 | `08-ledger-settlement` | `ledger` | 복식부기 원장, HALF_UP 수수료, KST 일 정산, 지급, 시산표 | `ledger.go`, `transactions.go`, `settlement.go`, `report.go` |
 | `09-reconciliation` | `recon` | PG 정산 CSV import + 대사 SQL(누락/중복/금액차) + 리포트 | `recon_queries.sql`, `importer.go`, `service.go` |
 | `10-observability` | `observability` | slog JSON 로그(request_id 전파), Prometheus 메트릭, 런북 | `logging.go`, `metrics.go`, `server.go`, `cmd/main.go` |
@@ -57,6 +57,7 @@ import 할 때는 별칭을 붙인다: `outboxpolling "github.com/jaehafe/paymen
 - `go run ./02-idempotency-key/cmd` — `:8081` HTTP 서버 (스키마 `go_02`)
 - `go run ./03-outbox-polling/cmd` — 결제 3건 → 릴레이 → 수신 출력 (스키마 `go_03`, 토픽 `payment.events.go03`)
 - `go run ./04-outbox-cdc/cmd` — Debezium E2E (스키마 `public`, 토픽 `payment.events`). 절차는 `04-outbox-cdc/README.md`
+- `go run ./07-payment-state-machine/cmd` — janitor 주기 실행 `Janitor.Run` (스키마 `go_07`, `JANITOR_INTERVAL` 기본 `10s`). Ctrl+C 로 종료
 - `go run ./10-observability/cmd` — `:8091` 결제 서버 + `/metrics` + `/admin/faults` (스키마 `go_10`). `--profile obs` 의 Prometheus 가 스크레이프. 런북은 `10-observability/README.md`
 
 02/03/10 이 별도 스키마를 쓰는 이유: 같은 DB 에서 03 의 `outbox`(폴링용 컬럼)와 04 의 `outbox`(Debezium 컬럼)가 충돌하지 않게, 그리고 Kotlin 앱과 테이블이 섞이지 않게.

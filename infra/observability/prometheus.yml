@@ -1,5 +1,8 @@
 global:
   scrape_interval: 5s
+  # 규칙 평가 주기. 기본값 1m이면 알림 pending/firing 이 최대 1분씩 늦어진다.
+  # Prometheus 공식 예시(documentation/examples/prometheus.yml)처럼 15s 로 둔다.
+  evaluation_interval: 15s
 rule_files:
   - /etc/prometheus/alerts.yml
 scrape_configs:

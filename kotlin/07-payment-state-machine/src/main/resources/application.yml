@@ -11,6 +11,8 @@ spring:
 
 lab:
   janitor:
+    enabled: true            # JanitorScheduler on/off (테스트는 끈다: 시각을 직접 넘겨 호출)
+    interval: 10s            # 한 바퀴가 끝난 뒤 다음 바퀴까지 쉬는 시간 (fixedDelay)
     max-attempts: 5          # 이만큼 확인해도 확정 못 하면 MANUAL_REVIEW (사람이 확인)
     base-backoff: 10s        # 10s, 20s, 40s, 80s ... 지수 백오프
     not-found-grace: 5m      # PG에 기록이 없어도 이 시간 동안은 FAILED로 단정하지 않는다

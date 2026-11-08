@@ -7,7 +7,8 @@ import java.time.Duration
 import java.time.Instant
 
 /**
- * 확정되지 않은 결제를 뒤처리하는 배치. (실서비스에선 @Scheduled로 주기 실행. 여기선 테스트가 시각을 넘겨 직접 호출)
+ * 확정되지 않은 결제를 뒤처리하는 배치.
+ * 앱에선 JanitorScheduler가 주기 실행하고, 테스트는 시각을 넘겨 직접 호출한다.
  *
  * - UNKNOWN: PG에 "그래서 승인됐어?"를 물어 APPROVED/FAILED로 확정
  * - CANCEL_REQUESTED: 실패한 PG 취소를 재시도

@@ -237,6 +237,13 @@ CREATE TABLE payment_status_history (
   - NOT_FOUND이고 grace 경과: FAILED. → PG에 도달 못한 결제는 MANUAL_REVIEW가 아니라 FAILED로 끝난다.
   - 판단 불가(PG 조회 오류): 시도로 센다. `next_retry_at = now + base · 2^min(attempt-1, 20)`, `attempt_count >= maxAttempts`면 `MANUAL_REVIEW`(보류, 사람 확인).
 - `CheckoutOrchestrator.checkout(order)`: 결제 승인 → 후속 단계(재고 확보 `InventoryClient.reserve`) 실패 시 **보상**: PG 취소 → `CANCELED`. 취소 실패 시 `CANCEL_REQUESTED`로 남기고(`attempt_count = 1`, `next_retry_at = now + 지연`) janitor가 재시도. janitor는 CAS 충돌 행은 건너뛰고 배치를 계속한다.
+- **스케줄 실행**: janitor는 앱 안에서 주기 실행된다. 한 바퀴 = `reconcileUnknown(now)` → `retryCancelRequested(now)` (`now` = 현재 시각).
+  - 고정 지연(fixed delay): 한 바퀴가 끝난 뒤 interval을 쉰다. (killbill `Janitor.start()`는 `scheduleAtFixedRate` — 여기선 PG가 느릴 때 밀린 실행이 연달아 붙지 않게 delay를 쓴다. 처리 대상은 `next_retry_at`이 정한다.)
+  - 한쪽 작업의 예외/에러는 로그만 남기고 다른 쪽과 다음 바퀴를 계속 실행한다. 처리한 건이 있으면 바퀴마다 요약 로그.
+  - Kotlin: `JanitorScheduler` — `@EnableScheduling` + `@ConditionalOnProperty(lab.janitor.enabled)`, `@Scheduled(fixedDelayString = "${lab.janitor.interval}")`. 기본 `enabled=true`, `interval=10s`. janitor를 시각을 넘겨 직접 부르는 테스트는 `lab.janitor.enabled=false`.
+  - Go: `Janitor.Run(ctx, interval)` — `select { <-ctx.Done() / <-time.After(interval) }`, ctx 취소 시 즉시 반환. `cmd/main.go`: `DATABASE_URL` + `&search_path=go_07`, `JANITOR_INTERVAL`(기본 `10s`), SIGINT/SIGTERM → ctx 취소.
+  - PG가 모르는 거래 id로 취소하면 PG 오류로 다룬다 (재예약·백오프, 배치 계속).
+  - PENDING(오래된 PENDING의 PG 조회)은 범위 밖 — 다음 단계 (killbill `IncompletePaymentTransactionTask.TRANSACTION_STATUSES_TO_CONSIDER = PENDING, UNKNOWN`).
 
 테스트:
 - `invalid_transition__rejected`
@@ -250,6 +257,9 @@ CREATE TABLE payment_status_history (
 - `not_found_within_grace__does_not_consume_attempts__ends_failed` (시계를 점프하지 않고 next_retry_at마다 janitor 실행)
 - `backoff__large_attempt__capped_without_overflow` (Go만)
 - `cancel_retry__stale_row_skipped__rest_of_batch_processed`, `janitor_crash_loop__claims_counted__moved_to_manual_review` (Kotlin만)
+- `cancel_retry__pg_unknown_tx__rescheduled_rest_of_batch_processed` (Kotlin)
+- `scheduler_reconciles_due_unknown_without_direct_call` (Kotlin, `JanitorSchedulerTest`) / `run__reconciles_due_unknown_on_schedule` (Go): 스케줄러를 켜고 짧은 주기로, janitor를 직접 부르지 않고 기한 지난 UNKNOWN(PG 승인 기록 있음)이 APPROVED가 될 때까지 폴링
+- `run__returns_promptly_when_ctx_cancelled` (Go만), `exception_in_one_task__does_not_escape_or_skip_other` (Kotlin만)
 
 README에 상태 다이어그램(mermaid)과 운영 쿼리(상태별 건수, 오래된 UNKNOWN, MANUAL_REVIEW 목록).
 

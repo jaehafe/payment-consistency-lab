@@ -36,6 +36,54 @@ stateDiagram-v2
    - claim에서 시도를 세므로 처리 도중 죽어도 시도로 남는다. `max-attempts`보다 많이 집힌 행(= 매번 처리하다 죽음)은 PG를 부르지 않고 MANUAL_REVIEW로 보낸다.
 4. **보상(Saga)**: 재고 확보 실패 → 먼저 `CANCEL_REQUESTED`를 커밋해 "취소해야 함"을 기록 → PG 취소 → `CANCELED`. 취소가 실패하면 `CANCEL_REQUESTED`로 남고 janitor가 재시도한다. 보상이 유실되지 않는다. 재시도 중 다른 경로가 먼저 확정한 건(compare-and-set 0행)은 건너뛰고 배치의 나머지를 계속 처리한다.
 
+## 스케줄 실행 (JanitorScheduler)
+
+앱을 띄우면 `JanitorScheduler`가 `reconcileUnknown(now)` → `retryCancelRequested(now)`를 주기 실행한다.
+
+```bash
+docker compose -f ../infra/docker-compose.yml up -d postgres
+cd kotlin
+./gradlew :07-payment-state-machine:bootRun --args='--lab.janitor.interval=2s'
+# 다른 터미널: 재확인 시각이 지난 UNKNOWN 한 건 (1시간 전 생성 → 유예 지남)
+psql postgres://lab:lab@localhost:15432/lab -c "INSERT INTO payments
+  (id, order_id, amount, status, idempotency_key, next_retry_at, created_at)
+  VALUES (gen_random_uuid(), 'o-1', 10000, 'UNKNOWN', 'idem-1',
+          now() - interval '1 minute', now() - interval '1 hour')"
+# 로그: JanitorScheduler : janitor run: unknown=1 cancelRequested=0
+# → o-1 은 FAILED (Fake PG 는 앱 메모리에만 있어서 밖에서 넣은 건 NOT_FOUND)
+```
+
+| 설정 | 기본값 | 의미 |
+|---|---|---|
+| `lab.janitor.enabled` | `true` | `false`면 `JanitorScheduler` 빈도 `@EnableScheduling`도 생기지 않는다 (`@ConditionalOnProperty`) |
+| `lab.janitor.interval` | `10s` | 한 바퀴가 **끝난 뒤** 다음 바퀴까지 쉬는 시간 (`fixedDelay`). 첫 실행도 기동 후 이만큼 뒤 |
+
+- 테스트는 끈다: `PaymentStateMachineTest`는 `now`를 직접 넘겨 janitor를 부른다. 스케줄러가 끼어들면 결정적이지 않다.
+- 실행 요약 로그: 집어 간 건이 있으면 INFO `janitor run: unknown=N cancelRequested=M`. 할 일 없는 바퀴는 DEBUG.
+- 한쪽 작업이 예외를 던져도 다른 쪽은 실행하고, 다음 주기도 그대로 돈다 (`Exception`만 잡는다. `Error`는 잡지 않는다).
+- 인스턴스가 여러 대여도 `claimDue`(SKIP LOCKED + lease) 덕분에 같은 행을 겹쳐 처리하지 않는다.
+
+**fixedDelay vs fixedRate.** killbill은 `scheduleAtFixedRate`를 쓴다 (이전 실행의 *시작* 기준). 여기선 `fixedDelay`(이전 실행의 *끝* 기준)를 골랐다.
+1. 한 바퀴의 시간은 PG 조회 속도에 달렸다. PG가 느려지면 fixedRate는 밀린 실행을 쉬지 않고 이어 붙여, 장애 중인 PG를 더 두드린다.
+2. 무엇을 처리할지는 `next_retry_at`(지수 백오프)이 정한다. 주기는 "얼마나 자주 확인하나"일 뿐이라 정확할 필요가 없다.
+3. Go 버전(`Janitor.Run`, `time.After`)과 같은 의미가 된다.
+
+어느 쪽이든 Spring 기본 스케줄러(스레드 1개)는 같은 메서드를 겹쳐 실행하지 않는다. killbill도 단일 스레드 executor다.
+
+**killbill 대응**
+
+| killbill (`payment/core/janitor`) | 이 모듈 |
+|---|---|
+| [`Janitor.start()` `:110`](https://github.com/killbill/killbill/blob/52e2f55f103baf0703ddee71e10a7036595fc851/payment/src/main/java/org/killbill/billing/payment/core/janitor/Janitor.java#L110) `janitorExecutor.scheduleAtFixedRate(incompletePaymentAttemptTask, period, period, unit)` | `JanitorScheduler.kt:47` `@Scheduled(initialDelayString, fixedDelayString)`. 첫 실행도 한 주기 뒤 (killbill의 `initialDelay = period`와 같음) |
+| [`PaymentExecutors` `:102`](https://github.com/killbill/killbill/blob/52e2f55f103baf0703ddee71e10a7036595fc851/payment/src/main/java/org/killbill/billing/payment/core/PaymentExecutors.java#L102) `newSingleThreadScheduledExecutor("PaymentJanitor")` | Spring 기본 `TaskScheduler` (`spring.task.scheduling.pool.size` 기본 1, 스레드 `scheduling-1`) |
+| `PaymentConfig` `org.killbill.payment.janitor.rate` (기본 `1h`) | `lab.janitor.interval` (기본 `10s`) |
+| [`IncompletePaymentAttemptTask.run()` `:165`](https://github.com/killbill/killbill/blob/52e2f55f103baf0703ddee71e10a7036595fc851/payment/src/main/java/org/killbill/billing/payment/core/janitor/IncompletePaymentAttemptTask.java#L165), 항목별 `catch (Exception) → log.warn("Exception during Janitor loop")` `:184` | `JanitorScheduler.kt:51` `run()`, 작업별 `catch (Exception) → log.warn` `:71` |
+| `Janitor.stop()` `:113`: `isStopped` + `shutdown()` + `awaitTermination(5s)` | 스프링 컨텍스트 종료 시 스케줄러 종료 (SIGTERM) |
+| [`IncompletePaymentTransactionTask` `:63`](https://github.com/killbill/killbill/blob/52e2f55f103baf0703ddee71e10a7036595fc851/payment/src/main/java/org/killbill/billing/payment/core/janitor/IncompletePaymentTransactionTask.java#L63) `TRANSACTION_STATUSES_TO_CONSIDER = PENDING, UNKNOWN` | `UNKNOWN`과 `CANCEL_REQUESTED`만. **PENDING은 아직 안 본다** (한계 참고) |
+| 재시도 시각: notification queue + [`getNextNotificationTime` `:402`](https://github.com/killbill/killbill/blob/52e2f55f103baf0703ddee71e10a7036595fc851/payment/src/main/java/org/killbill/billing/payment/core/janitor/IncompletePaymentAttemptTask.java#L402) (`unknown.retries` 기본 `5m,1h,1d,...`, `pending.retries` 기본 `1h,1d`) | `next_retry_at` 컬럼 + 지수 백오프 (`base-backoff` 10s × 2^n) |
+
+주의: killbill에서 fixedRate로 도는 건 `IncompletePaymentAttemptTask`(INIT 상태로 남은 *attempt*, `attempts.delay` 기본 12h 지난 것)다. UNKNOWN/PENDING *transaction*의 재확인은 `IncompletePaymentTransactionTask`가 notification queue의 예약 시각에 맞춰 처리한다. 이 모듈은 둘을 합쳐 "주기 실행 + 행마다 `next_retry_at`"으로 단순화했다.
+
 ## 핵심 코드 위치
 
 - `src/main/kotlin/lab/statemachine/PaymentStatus.kt:19` — 허용 전이표
@@ -43,8 +91,9 @@ stateDiagram-v2
 - `src/main/kotlin/lab/statemachine/PaymentRepository.kt:41` — CAS UPDATE (`:49` `WHERE id = ? AND status = ?`)
 - `src/main/kotlin/lab/statemachine/PaymentRepository.kt:70` — janitor claim (`FOR UPDATE SKIP LOCKED` + lease + attempt_count +1 `:73`)
 - `src/main/kotlin/lab/statemachine/PaymentService.kt:15` — PENDING 선커밋(`:25`), PG 호출(`:29`), 타임아웃 → UNKNOWN(`:34`)
-- `src/main/kotlin/lab/statemachine/Janitor.kt:30` — `reconcileUnknown`: crash loop 보류(`:34`), NOT_FOUND 유예(`:51`, 유예 안은 시도 안 씀 `:57`), MANUAL_REVIEW(`:91`), 백오프(`:101`)
-- `src/main/kotlin/lab/statemachine/Janitor.kt:71` — `retryCancelRequested` (충돌 건 건너뛰기 `:77`)
+- `src/main/kotlin/lab/statemachine/Janitor.kt:31` — `reconcileUnknown`: crash loop 보류(`:35`), NOT_FOUND 유예(`:52`, 유예 안은 시도 안 씀 `:58`), MANUAL_REVIEW(`:92`), 백오프(`:102`)
+- `src/main/kotlin/lab/statemachine/Janitor.kt:72` — `retryCancelRequested` (충돌 건 건너뛰기 `:78`)
+- `src/main/kotlin/lab/statemachine/JanitorScheduler.kt:34` — 스케줄러: `@EnableScheduling` + `@ConditionalOnProperty`(`:36`), `@Scheduled` fixedDelay(`:47`), 한 바퀴 `run()`(`:51`), 예외 → 로그(`:71`), 요약 로그(`:64`)
 - `src/main/kotlin/lab/statemachine/CheckoutOrchestrator.kt:42` — 보상: CANCEL_REQUESTED 선커밋(`:45`) → PG 취소(`:50`) → 실패 시 재시도 예약(`:55`)
 
 ## 테스트 실행
@@ -54,7 +103,7 @@ cd kotlin
 ./gradlew :07-payment-state-machine:test
 ```
 
-janitor는 `now`를 인자로 받는다 → 테스트에서 시간을 "넘겨" 백오프/유예를 실제로 기다리지 않고 검증한다.
+janitor는 `now`를 인자로 받는다 → 테스트에서 시간을 "넘겨" 백오프/유예를 실제로 기다리지 않고 검증한다. 그래서 `PaymentStateMachineTest`는 스케줄러를 끈다(`lab.janitor.enabled=false`). 스케줄링 자체는 `JanitorSchedulerTest`가 따로 켜서 검증한다 (`@DirtiesContext`로 끝나면 스케줄러를 닫는다).
 
 | 테스트 | 증명하는 것 |
 |---|---|
@@ -69,6 +118,8 @@ janitor는 `now`를 인자로 받는다 → 테스트에서 시간을 "넘겨" �
 | `cancel_failure__left_cancel_requested__janitor_retries_cancel` | 취소 실패 → CANCEL_REQUESTED 유지 → PG 복구 후 janitor가 CANCELED |
 | `cancel_retry__stale_row_skipped__rest_of_batch_processed` | 취소 재시도 중 한 건을 다른 경로가 먼저 확정 → 그 건은 건너뛰고 나머지 건도 CANCELED |
 | `janitor_crash_loop__claims_counted__moved_to_manual_review` | claim만 하고 죽는 상황 5회 → 6번째 claim에서 MANUAL_REVIEW (attempt_count 6) |
+| `JanitorSchedulerTest.scheduler_reconciles_due_unknown_without_direct_call` | `lab.janitor.enabled=true`, interval 200ms. PG엔 승인 기록, DB엔 기한 지난 UNKNOWN → janitor를 직접 부르지 않아도 APPROVED (폴링, 상한 10초) |
+| `JanitorSchedulerRunTest.exception_in_one_task__does_not_escape_or_skip_other` | `reconcileUnknown`이 예외를 던져도 `run()`은 예외를 밖으로 던지지 않고 `retryCancelRequested`도 실행. 두 바퀴 연속 |
 
 ## 운영 쿼리
 
@@ -101,8 +152,9 @@ FROM payment_status_history WHERE payment_id = :id ORDER BY id;
 
 ## 한계 / 다음 단계
 
-- 서버가 PG 호출 도중 죽으면 결제가 `PENDING`에 남는다. 실서비스에선 "일정 시간 이상 PENDING"도 UNKNOWN처럼 janitor가 조회해야 한다 (여기선 생략).
+- 서버가 PG 호출 도중 죽으면 결제가 `PENDING`에 남는다. **다음 단계**: 스케줄러가 "일정 시간 이상 PENDING"도 UNKNOWN처럼 PG 조회로 정리한다. killbill은 [`TRANSACTION_STATUSES_TO_CONSIDER = PENDING, UNKNOWN`](https://github.com/killbill/killbill/blob/52e2f55f103baf0703ddee71e10a7036595fc851/payment/src/main/java/org/killbill/billing/payment/core/janitor/IncompletePaymentTransactionTask.java#L63)으로 둘 다 보고, PENDING은 별도 재시도 간격(`org.killbill.payment.janitor.pending.retries`, 기본 `1h, 1d`)을 쓴다. 여기선 `PENDING`엔 `next_retry_at`이 없으므로 `updated_at < now - pending-grace`로 집는 조건이 필요하다.
 - `NOT_FOUND`로 FAILED 처리한 뒤 PG가 늦게 승인할 수도 있다(PG 내부 지연). 결국 **09 대사**(MISSING_IN_INTERNAL)가 잡아낸다.
 - 취소 재시도는 포기하지 않고 백오프로 계속한다. 실패가 길어지면 알림(attempt_count 기준)을 걸어 사람이 개입한다.
-- janitor는 여기서 테스트가 직접 호출한다. 실서비스에선 `@Scheduled` + 인스턴스 여러 대 (claim 덕분에 안전).
+- 스케줄러는 인스턴스마다 돈다. claim 덕분에 겹쳐 처리하진 않지만, 대수가 늘면 빈 바퀴 조회도 늘어난다. 한 대만 돌리려면 ShedLock 같은 분산 락이 필요하다 (killbill은 `GlobalLocker`로 계정 단위 락).
+- ~~Fake PG가 모르는 `pg_tx_id`를 취소하면 `NoSuchElementException`이 나서 배치가 멈추던 문제~~ → 고침: `PgException`으로 응답해 백오프로 재예약된다 (Go와 동일). 테스트 `cancel_retry__pg_unknown_tx__rescheduled_rest_of_batch_processed`.
 - 상태가 맞아도 "돈이 어디서 어디로 갔는지"는 별도 기록이 필요하다 → **08 원장**.
