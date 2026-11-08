@@ -34,6 +34,12 @@ type FakePaymentGateway struct {
 	FailCancel          atomic.Bool // 취소 API 실패
 	FailStatusQuery     atomic.Bool // 조회 API 장애
 
+	// 테스트 훅 (nil 이면 안 부름). 경쟁 상황을 결정적으로 재현한다.
+	// 테스트가 호출 전에 한 번 넣고 바꾸지 않는다고 가정한다.
+	OnBeforeCharge func(key string) // 승인 요청이 PG 에 닿기 전 (요청이 PG 앞에서 멈춘 상황)
+	OnCharge       func(key string) // 승인이 PG 에 기록된 직후, 응답 전
+	OnGetStatus    func(key string) // 조회 요청이 PG 에 도착한 순간
+
 	mu      sync.Mutex
 	byKey   map[string]*pgRecord // idempotencyKey → 기록
 	byTxID  map[string]*pgRecord // pgTxId → 기록
@@ -53,6 +59,9 @@ func NewFakePaymentGateway() *FakePaymentGateway {
 
 // Charge 는 승인. 같은 key 로 다시 오면 기존 결과를 돌려준다 (PG 멱등성).
 func (g *FakePaymentGateway) Charge(ctx context.Context, key, orderID string, amount int64) (string, error) {
+	if g.OnBeforeCharge != nil {
+		g.OnBeforeCharge(key) // 아직 PG 에 기록 없음
+	}
 	if g.TimeoutBeforeCharge.Load() {
 		return "", ErrPgTimeout // PG 는 아무것도 모른다
 	}
@@ -70,6 +79,9 @@ func (g *FakePaymentGateway) Charge(ctx context.Context, key, orderID string, am
 	}
 	g.mu.Unlock()
 
+	if g.OnCharge != nil {
+		g.OnCharge(key) // 잠금을 푼 뒤에 부른다 (훅이 GetStatus 를 불러도 됨)
+	}
 	if g.TimeoutAfterCharge.Load() {
 		return "", ErrPgTimeout // 승인은 됐지만 응답 유실
 	}
@@ -81,6 +93,12 @@ func (g *FakePaymentGateway) Charge(ctx context.Context, key, orderID string, am
 
 // GetStatus 는 idempotency key 로 PG 측 상태를 조회한다. (상태, pgTxId, 에러)
 func (g *FakePaymentGateway) GetStatus(ctx context.Context, key string) (PgStatus, string, error) {
+	if g.OnGetStatus != nil {
+		g.OnGetStatus(key)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", err // 호출자가 정한 시간 안에 응답하지 못함 (실제 HTTP 클라이언트처럼)
+	}
 	if g.FailStatusQuery.Load() {
 		return "", "", ErrPgQuery
 	}
@@ -95,6 +113,9 @@ func (g *FakePaymentGateway) GetStatus(ctx context.Context, key string) (PgStatu
 
 // Cancel 은 승인 취소. 이미 취소된 건이면 성공으로 본다 (취소도 멱등해야 재시도가 안전하다).
 func (g *FakePaymentGateway) Cancel(ctx context.Context, pgTxID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if g.FailCancel.Load() {
 		return ErrPgCancel
 	}

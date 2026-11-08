@@ -1,3 +1,7 @@
+-- 이 단계의 테이블은 스키마 k09에 만든다. 커넥션의 search_path 는 application.yml 의
+-- spring.datasource.hikari.schema=k09 가 맞춰 두므로 아래 DDL에는 스키마 접두어가 없다.
+CREATE SCHEMA IF NOT EXISTS k09;
+
 -- 우리 시스템이 기록한 거래 (08의 transactions를 대사용으로 간소화)
 CREATE TABLE IF NOT EXISTS internal_transactions (
   id          UUID PRIMARY KEY,

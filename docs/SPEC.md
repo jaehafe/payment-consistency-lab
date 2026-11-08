@@ -14,6 +14,12 @@ Kotlin 코드를 읽고 Go 코드를 나란히 놓고 비교할 수 있게 하�
 - **브로커**: Kafka (로컬은 Redpanda). 토픽 `payment.events`. 메시지 key = `orderId`(주문 단위 순서 보장), 헤더 `message_id` = 이벤트 고유 ID.
 - **DB**: PostgreSQL 16. SQL은 ORM 없이 직접 작성 (Kotlin: `JdbcTemplate`/`TransactionTemplate`, Go: `pgx/v5`) — 트랜잭션 경계를 눈으로 보기 위해서.
 - **테스트**: Testcontainers(Postgres, Redpanda)로 실제 인프라를 띄운다. 각 단계의 핵심 학습 포인트는 **테스트가 증명**한다.
+- **스키마 규칙 (단계별 Postgres 스키마)**: 로컬 compose DB(`localhost:15432/lab`)는 모든 단계·두 언어가 같이 쓴다. 단계마다 이름이 같고 컬럼이 다른 테이블(`payments`는 01~04, 07, 10이 전부 다르다)이 있으므로 **단계마다 자기 스키마**에 테이블을 둔다. 아래 SPEC의 DDL은 스키마 접두어 없이 쓰고, 어느 스키마에 만들지는 커넥션의 `search_path`가 정한다.
+  - Kotlin 단계 N → 스키마 `kNN` (`k01`~`k10`). `schema.sql` 첫 문장이 `CREATE SCHEMA IF NOT EXISTS kNN;`, 커넥션은 `application.yml`의 `spring.datasource.hikari.schema: kNN` — Hikari가 새 커넥션마다 `Connection.setSchema` → pgjdbc가 `SET search_path TO 'kNN'`. `spring.sql.init`(schema.sql)과 `JdbcTemplate`이 같은 풀을 쓰므로 DDL·쿼리 모두 접두어가 필요 없다. JDBC URL의 `currentSchema` 대신 이걸 쓰는 이유: 테스트의 `@ServiceConnection`과 e2e의 `--spring.datasource.url`은 URL을 통째로 바꾸지만 `hikari.schema`는 남는다 → bootRun·테스트·e2e가 같은 설정을 탄다.
+  - Go → `go_NN` (cmd가 있는 02/03/07/10: DSN에 `search_path=go_NN` + `CREATE SCHEMA IF NOT EXISTS`).
+  - **예외: 04는 Kotlin·Go 모두 `public`.** Debezium 커넥터(`infra/debezium/outbox-connector.json`)의 `table.include.list = public.outbox` 하나가 두 언어의 outbox를 같이 발행한다. public에는 04만 테이블을 만든다.
+  - psql로 들여다볼 때는 `SET search_path TO k07;` 처럼 먼저 맞춘다 (e2e의 `psql_q`는 DB `e2e_kNN`에 자동으로 `search_path=kNN`).
+  - 확인: Kotlin `SchemaIsolationTest`(07 모듈) — 각 모듈의 application.yml 설정 + schema.sql을 한 DB에 01→10 순서로 적용해 테이블이 자기 스키마에 있는지, 03 다음 07이 뜨는지 본다.
 - 이벤트 payload(JSON): `{"paymentId": "...", "orderId": "...", "amount": 10000, "pgTxId": "...", "occurredAt": "ISO-8601"}`
 
 ## 01-dual-write-problem — 문제 재현
@@ -143,14 +149,35 @@ CREATE TABLE processed_messages (
 ```
 - `NaiveConsumer`: 메시지 받을 때마다 orders 갱신 + point_ledger insert.
 - `IdempotentConsumer`: 같은 트랜잭션에서 `INSERT INTO processed_messages ... ON CONFLICT DO NOTHING` → 영향 행 0이면 skip. DB 커밋 **후** Kafka offset 커밋.
-- 처리 실패 시: 실패한 레코드 **앞까지만** offset 커밋하고 실패 레코드부터 다시 받는다 (Kotlin: `ConsumerRunner`가 실패한 배치를 커밋하지 않고 컨슈머를 재생성 → 배치 전체 재전달, 성공분은 processed_messages가 skip. Go: `rewindFrom`이 먼저 되감고 실패 앞까지 커밋 + `ConsumerLoop.Run`. fetch 에러 시에도 받은 레코드 전부 되감기). 실패 메시지를 건너뛰고 뒤 메시지 offset을 커밋하면 유실.
-- `message_id` 헤더가 없으면 명확한 에러(poison message, DLQ는 범위 밖).
+- 처리 실패 시: 실패한 레코드 **앞까지만** offset 커밋하고 실패 레코드부터 다시 받는다 (Kotlin: `ConsumerLoop`가 실패 레코드 앞까지 커밋하고 예외를 던지면 `ConsumerRunner`가 컨슈머를 재생성 → 실패 레코드부터 재전달. Go: `rewindFrom`이 먼저 되감고 실패 앞까지 커밋 + `ConsumerLoop.Run`. fetch 에러 시에도 받은 레코드 전부 되감기). 실패 메시지를 건너뛰고 뒤 메시지 offset을 커밋하면 유실.
+- `message_id` 헤더가 없으면 명확한 에러.
+- **DLT (dead letter topic)** — Spring Kafka `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` 를 의존성 없이 손으로 구현. 설정하지 않으면 위처럼 무한 재시도.
+  - 토픽 이름 `<topic>-dlt` (Spring Kafka 3.3+ 기본값). 파티션은 key 로 결정.
+  - **에러 분류** (Spring `ExceptionClassifier` 처럼 원인 체인 전체를 본다. Kotlin `FailureClassifier`, Go `classify`):
+    - **not-retryable** → 1번 만에 DLT: `message_id` 헤더 누락(Kotlin `MissingMessageIdException`, Go `ErrMissingMessageID`).
+    - **transient**(인프라 장애) → **DLT 로 보내지 않고 시도 횟수도 세지 않는다**. 장애가 풀릴 때까지 무한 재시도(그동안 파티션 정지).
+      Kotlin: `TransientDataAccessException`, `RecoverableDataAccessException`, `DataAccessResourceFailureException`(`CannotGetJdbcConnectionException` 포함), `CannotCreateTransactionException`(TransactionTemplate 이 커넥션을 못 얻을 때), `SQLTransientException`/`SQLRecoverableException`/`SQLNonTransientConnectionException`, `SocketException`/`SocketTimeoutException`.
+      Go: `*pgconn.ConnectError`, `pgconn.SafeToRetry`/`pgconn.Timeout`, `net.Error`, `context.DeadlineExceeded`/`Canceled`, `io.EOF`/`io.ErrUnexpectedEOF`.
+      공통: SQLSTATE `08xxx`, `53xxx`, `57P01`/`57P02`/`57P03`, `57014`, `40001`, `40P01`.
+    - **retryable** → 같은 (토픽, 파티션, offset)이 `maxAttempts`(기본 3) 번 실패하면 DLT: 깨진 JSON(decode 실패), 검증 실패, 그 밖의 결정적 DB 에러(`23xxx` 제약 위반 등), 그리고 **분류되지 않은 모든 에러(기본값)**. 이유: 모르는 에러를 transient 로 두면 payload 버그 하나가 파티션을 영원히 멈춘다 (Spring 기본값 `defaultValue=true` 와 같음). 반대로 분류 못 한 인프라 에러로 멀쩡한 메시지가 DLT 에 가도 원본·위치가 남으므로 유실은 아니다.
+  - **재시도 간격**: 연속 실패마다 지수 백오프 — 초기값(Kotlin `lab.consumer.retry.initial-delay`, 기본 1s / Go `Run(ctx, retryDelay)`) × 2ⁿ, 상한 30s(Kotlin `lab.consumer.retry.max-delay` / Go `ConsumerLoop.MaxRetryDelay`, 기본 `DefaultMaxRetryDelay`). 메시지를 처리하면 초기값으로 리셋.
+  - **`maxAttempts` 는 컨슈머 인스턴스별 메모리 카운트**다: 재시작하거나 리밸런스로 파티션이 넘어가면 0 부터 다시 센다 (→ 전체로는 maxAttempts 보다 더 시도될 수 있음). 빠진 파티션의 기록은 리밸런스 훅에서 지운다 — Kotlin `ConsumerLoop` 의 `ConsumerRebalanceListener`(revoked/lost 는 지우고 assigned 는 현재 할당만 남김. `close()` 중의 revoke 는 무시 — `ConsumerRunner`의 재생성이 횟수를 리셋하지 않게), Go `DeadLetter.ForgetPartitions` 를 `kgo.OnPartitionsRevoked`/`kgo.OnPartitionsLost` 로 건다. Kotlin은 `ConsumerRunner`가 루프를 재생성하므로 횟수를 루프 밖 `DeadLetterPublisher`에 둔다.
+  - **설정 검증**: `maxAttempts >= 1`, Go `Producer != nil` — Kotlin `DeadLetterPublisher` 생성 시(`IllegalArgumentException`), Go `NewDeadLetter`(+ 리터럴로 만든 경우 `PollOnce`/`Run` 시작 시 `ErrInvalidDeadLetter`).
+  - DLT 레코드: 원래 key·value·헤더 유지 + `kafka_dlt-original-topic` / `-partition` / `-offset` / `-consumer-group`, `kafka_dlt-exception-fqcn`, `kafka_dlt-exception-message`, `kafka_dlt-attempts`(lab 전용). 값은 모두 UTF-8 문자열 (Spring 은 partition/offset 을 binary 로 넣음).
+  - **DLT 발행 ack 후에만** 그 레코드를 넘어 커밋한다. 발행 실패 시 커밋하지 않고 재시도 (커밋 먼저 → 발행 실패 = 유실). DLT 발행 자체는 at-least-once (ack 후 커밋 전 크래시 → DLT 중복).
 - 테스트:
   - `naive_consumer__duplicate_message__points_doubled`
   - `idempotent_consumer__duplicate_message__processed_once`
   - `idempotent_consumer__crash_before_offset_commit__redelivery_is_skipped` (재전달 skip 후 offset = 메시지 offset + 1 단언)
-  - `consumer_loop__missing_message_id_header__fails_with_clear_error`
+  - `consumer_loop__missing_message_id_header__fails_with_clear_error` (DLT 미설정 시)
   - `idempotent_consumer__handler_failure__offset_not_committed_past_failed_message` (Go만)
+  - `dead_letter__always_failing_message__sent_to_dlt_after_max_attempts` (헤더 단언, 뒤 메시지 처리, offset = 2)
+  - `dead_letter__missing_message_id__sent_to_dlt_without_retry` (attempts = 1)
+  - `dead_letter__transient_failure__processed_without_dlt`
+  - `dead_letter__dlt_publish_fails__offset_not_committed_past_message`
+  - `dead_letter__db_connection_error__retried_past_max_attempts_without_dlt` (실제 연결 실패 5번 > maxAttempts → 처리됨, DLT 비어 있음, offset = 2)
+  - `dead_letter__malformed_json__sent_to_dlt_after_max_attempts` (깨진 JSON → maxAttempts 번 후 DLT)
+  - 단위: 에러 분류표, 백오프(1s→2s→4s…→30s 상한), 잘못된 설정 거부, 리밸런스 시 실패 기록 정리
 
 ## 코드 스타일
 
@@ -226,10 +253,10 @@ CREATE TABLE payment_status_history (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
-상태: `REQUESTED → PENDING → APPROVED | FAILED | UNKNOWN`, `UNKNOWN → APPROVED | FAILED | MANUAL_REVIEW`, `APPROVED → CANCEL_REQUESTED → CANCELED`.
+상태: `REQUESTED → PENDING → APPROVED | FAILED | UNKNOWN`, `UNKNOWN → APPROVED | FAILED | MANUAL_REVIEW`, `APPROVED → CANCEL_REQUESTED → CANCELED`, `FAILED → CANCEL_REQUESTED` (늦은 승인 망취소 전용 — 아래 sweepPending 경쟁 규칙). `FAILED → APPROVED`는 금지.
 - 허용 전이표를 코드에 명시, 그 외 전이는 예외.
 - 전이는 `UPDATE ... SET status=? WHERE id=? AND status=?` (compare-and-set) + history insert 를 한 트랜잭션에서.
-- Fake PG: `charge(key, orderId, amount)`, `getStatus(key) -> APPROVED|FAILED|NOT_FOUND`, `cancel(pgTxId)`. 실패 주입: timeoutAfterCharge, timeoutBeforeCharge(요청이 PG에 도달 못함), failCancel.
+- Fake PG: `charge(key, orderId, amount)`, `getStatus(key) -> APPROVED|FAILED|NOT_FOUND`, `cancel(pgTxId)`. 실패 주입: timeoutAfterCharge, timeoutBeforeCharge(요청이 PG에 도달 못함), failCancel. 테스트 훅: beforeCharge(PG 기록 전, Go `OnBeforeCharge`), onCharge(기록 직후, 응답 전), onGetStatus.
 - PG 타임아웃 → `UNKNOWN` (실패로 단정하지 않는다! 승인됐을 수 있음).
 - `Janitor.reconcileUnknown(now)`: `UNKNOWN AND next_retry_at <= now` 를 `FOR UPDATE SKIP LOCKED`로 집어 PG 조회 → APPROVED/FAILED 확정.
   - `attempt_count` = janitor 확인 횟수. 행을 집을 때 같은 문장에서 +1 한다 (집은 뒤 크래시해도 횟수가 남는다 — Go는 PG 호출이 트랜잭션 안이라 롤백되는 한계).
@@ -237,13 +264,25 @@ CREATE TABLE payment_status_history (
   - NOT_FOUND이고 grace 경과: FAILED. → PG에 도달 못한 결제는 MANUAL_REVIEW가 아니라 FAILED로 끝난다.
   - 판단 불가(PG 조회 오류): 시도로 센다. `next_retry_at = now + base · 2^min(attempt-1, 20)`, `attempt_count >= maxAttempts`면 `MANUAL_REVIEW`(보류, 사람 확인).
 - `CheckoutOrchestrator.checkout(order)`: 결제 승인 → 후속 단계(재고 확보 `InventoryClient.reserve`) 실패 시 **보상**: PG 취소 → `CANCELED`. 취소 실패 시 `CANCEL_REQUESTED`로 남기고(`attempt_count = 1`, `next_retry_at = now + 지연`) janitor가 재시도. janitor는 CAS 충돌 행은 건너뛰고 배치를 계속한다.
-- **스케줄 실행**: janitor는 앱 안에서 주기 실행된다. 한 바퀴 = `reconcileUnknown(now)` → `retryCancelRequested(now)` (`now` = 현재 시각).
+- `Janitor.sweepPending(now)` (Go `SweepPending`): `PENDING AND created_at <= now - pendingAfter` 를 claim (UNKNOWN과 같은 SKIP LOCKED + attempt_count +1; PENDING엔 next_retry_at이 없어 created_at으로 고르고, Kotlin은 lease를 next_retry_at에 기록). 진행 중인 요청과 경쟁하지 않기 위한 cutoff (killbill `getCreatedDateBefore`). 설정: Kotlin `lab.janitor.pending-after`(기본 2m), Go `PendingAfter`(cmd 2m, 0 이하는 에러).
+  - APPROVED → APPROVED(pg_tx_id), FAILED → FAILED.
+  - NOT_FOUND: UNKNOWN과 같은 grace 규칙. grace 경과면 FAILED, 아니면 PENDING → UNKNOWN (`next_retry_at = created_at + notFoundGrace`, 시도로 세지 않음).
+  - 판단 불가(PG 조회 오류): PENDING → UNKNOWN (`next_retry_at = now + backoff(attempt)`, 1회로 셈). 이후 재시도·MANUAL_REVIEW는 reconcileUnknown이 맡는다.
+  - Kotlin: `attempt_count > maxAttempts`(crash loop)면 PG 조회 없이 PENDING → UNKNOWN → crash-loop 규칙으로 MANUAL_REVIEW.
+  - 요청 스레드와 경쟁: CAS로 하나만 이긴다. 요청이 먼저면 janitor는 건너뛰고 배치 계속. janitor가 먼저면 요청의 `PENDING → *`는 Stale — PaymentService는 예외/에러로 내보내지 않되, **다시 읽어 요청이 PG에서 받은 결과와 맞춘다** (janitor가 본 PG 기록은 그 시각의 것이라 NOT_FOUND였을 수 있다):
+    - 승인 + 저장 APPROVED / 거절 + 저장 FAILED / 요청도 모름(타임아웃): 저장된 상태 반환, 추가 전이 없음.
+    - 승인 + 저장 UNKNOWN → `UNKNOWN → APPROVED`(+pg_tx_id, next_retry_at NULL). 거절 + 저장 UNKNOWN → `UNKNOWN → FAILED`.
+    - 승인 + 저장 FAILED (janitor가 grace 후 NOT_FOUND로 FAILED 확정 → 그 뒤 PG 승인, 돈 빠짐) → **망취소**: ERROR 로그, `FAILED → CANCEL_REQUESTED`(+pg_tx_id, attempt_count 0, next_retry_at = now + 지연) 커밋 → PG cancel → `CANCELED`. 취소 실패면 `CANCEL_REQUESTED`(attempt_count 1, next_retry_at = now + 지연)로 남아 retryCancelRequested가 재시도. FAILED는 이미 밖으로 나간 결론이라 되살리지 않는다.
+    - 그 외(MANUAL_REVIEW 등): 저장된 상태 반환 + WARN 로그. 맞추는 전이가 또 Stale이면 다시 읽기(최대 3회).
+    - 지연: Kotlin `lab.janitor.base-backoff`, Go `PaymentService.CancelRetryDelay`(0이면 10s).
+  - Go: janitor는 행 잠금을 쥔 채 PG를 부르므로 PG 조회·취소 1회에 `PgCallTimeout`(0이면 5s)을 건다. 시간 초과는 판단 불가로 다룬다(조회 → UNKNOWN 백오프, 취소 → 재예약). Fake PG의 조회·취소는 ctx가 끝났으면 `ctx.Err()`.
+  - Kotlin: `pending-after`가 0 이하면 `Janitor` 생성 시 `IllegalArgumentException` (Go는 `SweepPending`이 에러).
+- **스케줄 실행**: janitor는 앱 안에서 주기 실행된다. 한 바퀴 = `sweepPending(now)` → `reconcileUnknown(now)` → `retryCancelRequested(now)` (`now` = 현재 시각).
   - 고정 지연(fixed delay): 한 바퀴가 끝난 뒤 interval을 쉰다. (killbill `Janitor.start()`는 `scheduleAtFixedRate` — 여기선 PG가 느릴 때 밀린 실행이 연달아 붙지 않게 delay를 쓴다. 처리 대상은 `next_retry_at`이 정한다.)
   - 한쪽 작업의 예외/에러는 로그만 남기고 다른 쪽과 다음 바퀴를 계속 실행한다. 처리한 건이 있으면 바퀴마다 요약 로그.
   - Kotlin: `JanitorScheduler` — `@EnableScheduling` + `@ConditionalOnProperty(lab.janitor.enabled)`, `@Scheduled(fixedDelayString = "${lab.janitor.interval}")`. 기본 `enabled=true`, `interval=10s`. janitor를 시각을 넘겨 직접 부르는 테스트는 `lab.janitor.enabled=false`.
   - Go: `Janitor.Run(ctx, interval)` — `select { <-ctx.Done() / <-time.After(interval) }`, ctx 취소 시 즉시 반환. `cmd/main.go`: `DATABASE_URL` + `&search_path=go_07`, `JANITOR_INTERVAL`(기본 `10s`), SIGINT/SIGTERM → ctx 취소.
   - PG가 모르는 거래 id로 취소하면 PG 오류로 다룬다 (재예약·백오프, 배치 계속).
-  - PENDING(오래된 PENDING의 PG 조회)은 범위 밖 — 다음 단계 (killbill `IncompletePaymentTransactionTask.TRANSACTION_STATUSES_TO_CONSIDER = PENDING, UNKNOWN`).
 
 테스트:
 - `invalid_transition__rejected`
@@ -260,6 +299,23 @@ CREATE TABLE payment_status_history (
 - `cancel_retry__pg_unknown_tx__rescheduled_rest_of_batch_processed` (Kotlin)
 - `scheduler_reconciles_due_unknown_without_direct_call` (Kotlin, `JanitorSchedulerTest`) / `run__reconciles_due_unknown_on_schedule` (Go): 스케줄러를 켜고 짧은 주기로, janitor를 직접 부르지 않고 기한 지난 UNKNOWN(PG 승인 기록 있음)이 APPROVED가 될 때까지 폴링
 - `run__returns_promptly_when_ctx_cancelled` (Go만), `exception_in_one_task__does_not_escape_or_skip_other` (Kotlin만)
+- `stuck_pending__pg_approved__janitor_marks_approved`
+- `stuck_pending__no_pg_record__failed_after_grace`, `stuck_pending__no_pg_record_past_grace__failed_directly`
+- `pending_younger_than_threshold__not_touched`
+- `stuck_pending__pg_status_unavailable__handed_to_unknown_flow` (Go: `…pg_query_unavailable…`)
+- `pending_race__janitor_settles_first__request_gets_no_error`
+- `pending_race__request_settles_first__janitor_skips_rest_continue` (Kotlin), `pending_race__request_waits_for_janitor_lock__then_adopts_settled` (Go: 훅 안에서 `pg_stat_activity.wait_event_type = 'Lock'`을 볼 때까지 기다려 요청이 실제로 잠금 대기함을 증명)
+- `pending_crash_loop__claims_counted__ends_manual_review` (Kotlin만), `sweep_pending__zero_threshold__rejected` (Go만), `pending_after_zero_or_negative__rejected_at_construction` (Kotlin만)
+- 늦은 PG 응답 (요청이 PG 앞에서 멈춘 사이 janitor가 먼저 정함, beforeCharge 훅):
+  - `late_pg_response__janitor_moved_to_unknown__request_approved__approved`
+  - `late_pg_response__janitor_moved_to_unknown__request_declined__failed`
+  - `late_pg_response__janitor_failed__request_approved__net_canceled`
+  - `late_pg_response__janitor_failed__net_cancel_fails__janitor_retries`
+  - `late_pg_response__janitor_failed__request_timed_out__keeps_stored`
+- `sweep_pending__pg_status_query_hangs__timeout_is_inconclusive` (Go만)
+- 스케줄: `scheduler_settles_stale_pending_without_direct_call` / `Test_run__settles_stale_pending_on_schedule`
+
+- `app_datasource__uses_k07_schema`, `boot_03_then_07__same_db__07_schema_applies_and_07_insert_works`, `boot_all_stages_in_order__same_db__every_table_lives_in_its_stage_schema` (Kotlin만, `SchemaIsolationTest` — 위 "스키마 규칙")
 
 README에 상태 다이어그램(mermaid)과 운영 쿼리(상태별 건수, 오래된 UNKNOWN, MANUAL_REVIEW 목록).
 

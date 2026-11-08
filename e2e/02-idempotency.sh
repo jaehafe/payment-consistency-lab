@@ -75,7 +75,7 @@ port_free $G_PORT || die "port $G_PORT busy"
 reset_db e2e_k02
 start_kotlin 02-idempotency-key k02 --server.port=$K_PORT --spring.datasource.url="$(jdbc_url e2e_k02)"
 wait_log "$E2E_LOG_DIR/k02.log" "Started IdempotencyApplication" 90 || die "Kotlin 02 did not start (see $E2E_LOG_DIR/k02.log)"
-run_scenarios kotlin "http://localhost:$K_PORT" e2e_k02 public
+run_scenarios kotlin "http://localhost:$K_PORT" e2e_k02 k02   # spring.datasource.hikari.schema=k02
 
 # ---- Go (cmd reads DATABASE_URL and PORT, uses schema go_02) ----
 reset_db e2e_g02

@@ -3,7 +3,7 @@
 #
 # Kotlin (README "SQL 직접 실행"):
 #   ./gradlew :09-reconciliation:bootRun        -> creates the tables and exits
-#   psql ... -v business_date="'2026-11-07'"  +  \i 09-reconciliation/src/main/resources/recon_queries.sql
+#   psql ... -v business_date="'2026-11-07'"  +  SET search_path TO k09;  +  \i 09-reconciliation/src/main/resources/recon_queries.sql
 #   against internal rows = ReconciliationTest.runMixed() and PG rows = fixtures/pg_settlement_2026-11-07.csv
 # Go (README: no cmd -> \i schema.sql, then PREPARE q(date) AS <query body>; EXECUTE q('2026-11-08'))
 #   against testdata/pg_settlement_2026-11-08.csv and a hand-made internal side.
@@ -16,7 +16,7 @@ GDB=e2e_g09
 load_settlement_csv() {
   local db="$1" file="$2"
   psql_q "$db" "CREATE TABLE e2e_stage (pg_tx_id text, order_id text, type text, amount bigint, fee bigint, transacted_at timestamptz)" >/dev/null
-  compose exec -T postgres psql -U lab -d "$db" -v ON_ERROR_STOP=1 -qc "COPY e2e_stage FROM STDIN WITH (FORMAT csv, HEADER true)" <"$file"
+  _psql "$db" -v ON_ERROR_STOP=1 -qc "COPY e2e_stage FROM STDIN WITH (FORMAT csv, HEADER true)" <"$file"
   psql_q "$db" "
     WITH f AS (INSERT INTO recon_files (file_name, file_hash, row_count)
                SELECT '$(basename "$file")', 'e2e-' || md5(random()::text), count(*) FROM e2e_stage RETURNING id)
@@ -43,8 +43,8 @@ rc=0
 (cd "$REPO/kotlin" && ./gradlew -q :09-reconciliation:bootRun --args="--spring.datasource.url=$(jdbc_url $KDB)") \
   >"$E2E_LOG_DIR/k09-bootRun.log" 2>&1 || rc=$?
 check_eq "[kotlin] bootRun creates the tables and exits by itself" 0 "$rc"
-check_eq "[kotlin] schema applied" "internal_transactions,pg_settlement_records,recon_files,recon_results" \
-  "$(psql_q $KDB "SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public'")"
+check_eq "[kotlin] schema applied in k09" "internal_transactions,pg_settlement_records,recon_files,recon_results" \
+  "$(psql_q $KDB "SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='k09'")"
 
 # internal side = ReconciliationTest.runMixed()
 psql_q "$KDB" "INSERT INTO internal_transactions (id, pg_tx_id, order_id, type, amount, occurred_at) VALUES
@@ -59,9 +59,9 @@ psql_q "$KDB" "INSERT INTO internal_transactions (id, pg_tx_id, order_id, type, 
 load_settlement_csv "$KDB" "$REPO/kotlin/09-reconciliation/src/test/resources/fixtures/pg_settlement_2026-11-07.csv"
 check_eq "[kotlin] fixture rows loaded" 8 "$(psql_q $KDB 'SELECT count(*) FROM pg_settlement_records')"
 
-log "README step: psql -v business_date=\"'2026-11-07'\" ; \\i 09-reconciliation/src/main/resources/recon_queries.sql"
+log "README step: psql -v business_date=\"'2026-11-07'\" ; SET search_path TO k09; \\i 09-reconciliation/src/main/resources/recon_queries.sql"
 KOUT="$E2E_LOG_DIR/k09-psql.out"
-(cd "$REPO/kotlin" && echo '\i 09-reconciliation/src/main/resources/recon_queries.sql' \
+(cd "$REPO/kotlin" && printf '%s\n' 'SET search_path TO k09;' '\i 09-reconciliation/src/main/resources/recon_queries.sql' \
   | run_psql "$KDB" -X -v ON_ERROR_STOP=1 -v business_date="'2026-11-07'" -qAt) >"$KOUT" 2>&1 || true
 sed 's/^/    /' "$KOUT" >&2
 KEXP="AMOUNT_MISMATCH|tx-mismatch|30000|29000|-1000

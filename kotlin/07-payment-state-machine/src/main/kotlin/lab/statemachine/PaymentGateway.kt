@@ -46,6 +46,15 @@ class FakePaymentGateway : PaymentGateway {
     /** 테스트 훅: 취소 요청이 PG에 도착한 순간 호출 (경쟁 상황을 결정적으로 재현하기 위해) */
     @Volatile var onCancel: ((pgTxId: String) -> Unit)? = null
 
+    /** 테스트 훅: 승인 요청이 PG에 닿기 전에 호출 (요청이 PG 앞에서 멈춘 상황. 아직 PG 기록 없음) */
+    @Volatile var beforeCharge: ((idempotencyKey: String) -> Unit)? = null
+
+    /** 테스트 훅: 승인이 PG에 기록된 직후, 응답을 돌려주기 전에 호출 */
+    @Volatile var onCharge: ((idempotencyKey: String) -> Unit)? = null
+
+    /** 테스트 훅: 조회 요청이 PG에 도착한 순간 호출 */
+    @Volatile var onGetStatus: ((idempotencyKey: String) -> Unit)? = null
+
     private data class Record(val pgTxId: String, val code: PgStatusCode, @Volatile var canceled: Boolean = false)
 
     private val records = ConcurrentHashMap<String, Record>()
@@ -53,6 +62,7 @@ class FakePaymentGateway : PaymentGateway {
     private val cancelCount = AtomicInteger()
 
     override fun charge(idempotencyKey: String, orderId: String, amount: Long): String {
+        beforeCharge?.invoke(idempotencyKey)
         if (timeoutBeforeCharge) throw PgTimeoutException("PG 장애 주입: 요청이 PG에 도달하지 못함")
         if (declineCharge) {
             records.putIfAbsent(idempotencyKey, Record("pg_" + UUID.randomUUID(), PgStatusCode.FAILED))
@@ -63,11 +73,13 @@ class FakePaymentGateway : PaymentGateway {
             chargeCount.incrementAndGet()
             Record("pg_" + UUID.randomUUID(), PgStatusCode.APPROVED)
         }
+        onCharge?.invoke(idempotencyKey)
         if (timeoutAfterCharge) throw PgTimeoutException("PG 장애 주입: 승인 후 응답 유실")
         return record.pgTxId
     }
 
     override fun getStatus(idempotencyKey: String): PgStatus {
+        onGetStatus?.invoke(idempotencyKey)
         if (statusUnavailable) throw PgException("PG 장애 주입: 조회 API 응답 없음")
         val r = records[idempotencyKey] ?: return PgStatus(PgStatusCode.NOT_FOUND)
         return PgStatus(r.code, r.pgTxId)
@@ -98,6 +110,9 @@ class FakePaymentGateway : PaymentGateway {
         failCancel = false
         statusUnavailable = false
         onCancel = null
+        beforeCharge = null
+        onCharge = null
+        onGetStatus = null
         records.clear()
         chargeCount.set(0)
         cancelCount.set(0)

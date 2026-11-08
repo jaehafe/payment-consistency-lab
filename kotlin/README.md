@@ -45,7 +45,11 @@ curl -i -X POST localhost:8080/payments \
 ## 공통 설계 선택
 
 - **JPA 없이 `JdbcTemplate` + `TransactionTemplate`**: `@Transactional` 대신 `tx.execute { ... }` 블록을 써서 트랜잭션이 어디서 시작하고 어디서 커밋되는지 코드에 그대로 보이게 했다.
-- **스키마**: 각 모듈 `src/main/resources/schema.sql` (`spring.sql.init.mode=always`).
+- **스키마**: 각 모듈 `src/main/resources/schema.sql` (`spring.sql.init.mode=always`). 단계 N의 테이블은 Postgres 스키마 `kNN`(`k01`~`k10`)에 만든다 —
+  `schema.sql` 첫 줄 `CREATE SCHEMA IF NOT EXISTS kNN`, 커넥션은 `spring.datasource.hikari.schema: kNN`(Hikari가 커넥션마다 `setSchema` → `SET search_path`).
+  그래서 compose DB `lab` 하나에서 단계를 차례로 `bootRun` 해도 이름이 같은 `payments`가 섞이지 않고, SQL에는 스키마 접두어가 없다.
+  예외는 04(`public`, Debezium 커넥터가 `public.outbox`를 본다). psql로 볼 때는 `SET search_path TO k07;` 처럼 먼저 맞춘다.
+  격리는 `07-payment-state-machine`의 `SchemaIsolationTest`가 확인한다 (각 모듈의 application.yml + schema.sql을 한 DB에 차례로 적용).
 - **장애 주입**: 실제 장애를 일으키기 어려운 지점(브로커 다운, 커밋 직전 DB 실패, 발행 후 크래시, PG 응답 유실)은 Fake/래퍼 컴포넌트의 토글로 주입한다. 그 외(Postgres 트랜잭션, 행 잠금, Kafka 발행/소비, offset 커밋)는 전부 실제 인프라에서 일어난다.
 - **이벤트 확인**: 테스트는 Kafka 토픽을 실제로 끝까지 읽어서 이벤트의 존재/개수/`message_id`를 확인한다 (`EventProbe`).
 

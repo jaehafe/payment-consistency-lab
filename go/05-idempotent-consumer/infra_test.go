@@ -84,19 +84,26 @@ func newFixture(t *testing.T) fixture {
 
 	suffix := uuid.NewString()[:8]
 	f := fixture{topic: fmt.Sprintf("%s.%s", TopicPaymentEvents, suffix), group: "point-service-" + suffix}
+	createTopic(t, f.topic)
+	return f
+}
+
+// createTopic 은 파티션 1개짜리 토픽을 만든다.
+func createTopic(t *testing.T, name string) {
+	t.Helper()
 	cl, err := kgo.NewClient(kgo.SeedBrokers(testBrokers))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cl.Close()
-	resp, err := kadm.NewClient(cl).CreateTopic(ctx, 1, 1, nil, f.topic)
+	ctx := context.Background()
+	resp, err := kadm.NewClient(cl).CreateTopic(ctx, 1, 1, nil, name)
 	if err == nil {
 		err = resp.Err
 	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	return f
 }
 
 // produce 는 같은 message_id 로 메시지를 times 번 보낸다. messageID 가 "" 이면 헤더를 뺀다.
@@ -127,16 +134,37 @@ func (f fixture) produce(t *testing.T, messageID string, times int) {
 	}
 }
 
-// newGroupClient 는 컨슈머 그룹에 참여하는 클라이언트를 만든다. 자동 커밋은 끈다 (직접 커밋하기 위해).
-func (f fixture) newGroupClient(t *testing.T) *kgo.Client {
+// produceRaw 는 value 를 그대로(JSON 검사 없이) 보낸다. poison payload 테스트용.
+func (f fixture) produceRaw(t *testing.T, messageID, value string) {
 	t.Helper()
-	cl, err := kgo.NewClient(
+	cl, err := kgo.NewClient(kgo.SeedBrokers(testBrokers))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	rec := &kgo.Record{
+		Topic: f.topic, Key: []byte("order-1"), Value: []byte(value),
+		Headers: []kgo.RecordHeader{
+			{Key: "message_id", Value: []byte(messageID)},
+		},
+	}
+	if err := cl.ProduceSync(context.Background(), rec).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// newGroupClient 는 컨슈머 그룹에 참여하는 클라이언트를 만든다. 자동 커밋은 끈다 (직접 커밋하기 위해).
+// extra 는 추가 옵션 (DLT 테스트의 리밸런스 훅 등).
+func (f fixture) newGroupClient(t *testing.T, extra ...kgo.Opt) *kgo.Client {
+	t.Helper()
+	opts := append([]kgo.Opt{
 		kgo.SeedBrokers(testBrokers),
 		kgo.ConsumerGroup(f.group),
 		kgo.ConsumeTopics(f.topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()), // 커밋된 offset 이 없으면 처음부터
 		kgo.DisableAutoCommit(),                           // ★ offset 은 DB 커밋 후에 우리가 직접 커밋한다
-	)
+	}, extra...)
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		t.Fatal(err)
 	}

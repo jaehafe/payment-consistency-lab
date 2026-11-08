@@ -1,3 +1,5 @@
+-- 스키마 접두어 없음 = public. 다른 Kotlin 단계(k01~k10)와 달리 public에 둔다: Debezium 커넥터가 public.outbox 를 본다
+-- (application.yml 주석 참고).
 CREATE TABLE IF NOT EXISTS payments (
   id          UUID PRIMARY KEY,
   order_id    TEXT NOT NULL UNIQUE,

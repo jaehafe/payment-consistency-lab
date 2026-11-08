@@ -75,6 +75,34 @@ class JanitorSchedulerTest {
         )
     }
 
+    @Test
+    fun scheduler_settles_stale_pending_without_direct_call() {
+        val id = UUID.randomUUID()
+        val key = "idem-$id"
+        // PENDING 커밋 → PG 승인 → 응답 기록 전에 서버가 죽었다.
+        // 3분 전 생성 (pending-after 2m 지남), next_retry_at 없음.
+        val pgTxId = pg.charge(key, "o-$id", 10_000)
+        jdbc.update(
+            """
+            INSERT INTO payments (id, order_id, amount, status,
+                                  idempotency_key, created_at)
+            VALUES (?, ?, 10000, 'PENDING', ?, ?)
+            """.trimIndent(),
+            id, "o-$id", key,
+            Timestamp.from(Instant.now().minusSeconds(180)),
+        )
+
+        awaitUntil(Duration.ofSeconds(10)) { status(id) == "APPROVED" }
+
+        assertEquals(
+            pgTxId,
+            jdbc.queryForObject(
+                "SELECT pg_tx_id FROM payments WHERE id = ?",
+                String::class.java, id,
+            ),
+        )
+    }
+
     private fun status(id: UUID): String? =
         jdbc.queryForObject(
             "SELECT status FROM payments WHERE id = ?",

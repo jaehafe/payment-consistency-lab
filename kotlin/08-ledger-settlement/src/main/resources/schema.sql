@@ -1,3 +1,7 @@
+-- 이 단계의 테이블은 스키마 k08에 만든다. 커넥션의 search_path 는 application.yml 의
+-- spring.datasource.hikari.schema=k08 가 맞춰 두므로 아래 DDL에는 스키마 접두어가 없다.
+CREATE SCHEMA IF NOT EXISTS k08;
+
 -- 복식부기 원장. 금액은 전부 원 단위 정수(BIGINT) — 부동소수점은 0.1 + 0.2 ≠ 0.3 이라 돈에 쓰면 안 된다.
 CREATE TABLE IF NOT EXISTS ledger_accounts (
   id       TEXT PRIMARY KEY,         -- 'pg:receivable', 'bank:cash', 'platform:fee_revenue', 'merchant:{id}:payable'

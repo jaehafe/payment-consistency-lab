@@ -32,7 +32,11 @@ var allowedTransitions = map[Status][]Status{
 	Unknown:         {Approved, Failed, ManualReview},
 	Approved:        {CancelRequested},
 	CancelRequested: {Canceled},
-	// Failed, ManualReview, Canceled 는 최종 상태 (나가는 전이 없음)
+	// FAILED → CANCEL_REQUESTED 는 "늦은 승인" 하나만을 위한 출구다:
+	// janitor 가 FAILED 로 확정한 뒤 진행 중이던 요청이 PG 승인을 받았다
+	// (돈이 빠졌다). 되살리지(→ APPROVED) 않고 망취소한다. PaymentService.netCancel.
+	Failed: {CancelRequested},
+	// ManualReview, Canceled 는 최종 상태 (나가는 전이 없음)
 	// MANUAL_REVIEW 를 사람이 처리한 뒤의 전이는 운영 도구의 몫이라 여기선 다루지 않는다.
 }
 

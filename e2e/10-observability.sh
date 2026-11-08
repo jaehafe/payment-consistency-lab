@@ -176,7 +176,7 @@ curl -s -X POST 'localhost:8091/admin/faults?hang=false' >/dev/null
 sleep 13   # in-flight requests finish their 5s timeout as UNKNOWN, then >1 scrape interval
 for j in $KJOB $GJOB; do
   check_eq "$j: payment_unknown_current (Prometheus) == DB count(UNKNOWN)" \
-    "$( [[ $j == $KJOB ]] && psql_q e2e_k10 "SELECT count(*) FROM payments WHERE status='UNKNOWN'" || psql_q e2e_g10 "SELECT count(*) FROM go_10.payments WHERE status='UNKNOWN'")" \
+    "$( [[ $j == $KJOB ]] && psql_q e2e_k10 "SELECT count(*) FROM k10.payments WHERE status='UNKNOWN'" || psql_q e2e_g10 "SELECT count(*) FROM go_10.payments WHERE status='UNKNOWN'")" \
     "$(prom_val "sum(payment_unknown_current{job=\"$j\"})")"
 done
 t_of() { awk -F'|' -v a="$1" -v j="$2" -v s="$3" '$1==a && $2==j && $3==s {print $4}' "$EV"; }
@@ -226,7 +226,7 @@ check_eq "kotlin: no double charge during storm (approved delta)" 0 $(( $(metric
 check_eq "kotlin: no extra PG call during storm" 0 $(( $(metric localhost:8090/actuator/prometheus '^pg_call_duration_seconds_count') - kc0 ))
 check_eq "go: no double charge during storm (approved delta)" 0 $(( $(metric localhost:8091/metrics '^payment_requests_total.*result="approved"') - ga0 ))
 check_eq "go: no extra PG call during storm" 0 $(( $(metric localhost:8091/metrics '^pg_call_duration_seconds_count') - gc0 ))
-check_eq "kotlin: one payments row for the storm order" 1 "$(psql_q e2e_k10 "SELECT count(*) FROM payments WHERE order_id='order-storm-8090'")"
+check_eq "kotlin: one payments row for the storm order" 1 "$(psql_q e2e_k10 "SELECT count(*) FROM k10.payments WHERE order_id='order-storm-8090'")"
 check_eq "go: one payments row for the storm order" 1 "$(psql_q e2e_g10 "SELECT count(*) FROM go_10.payments WHERE order_id='order-storm-8091'")"
 MISSED="$(curl -s "$PROM/metrics" | awk '/^prometheus_rule_group_iterations_missed_total/{print $NF}')"
 RESULTS+=("INFO  Prometheus missed rule-group iterations so far: ${MISSED:-?} (non-zero shifts the timeline by 1 eval interval)")

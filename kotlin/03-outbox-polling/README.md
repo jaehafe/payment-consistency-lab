@@ -34,9 +34,11 @@ tx {
 - `src/main/kotlin/lab/outbox/polling/OutboxRelayScheduler.kt:22` — 주기 실행 (밀려 있으면 연속 실행)
 - `src/main/resources/schema.sql` — 미발행 행만 담는 부분 인덱스, 테이블 이름이 `outbox_polling`인 이유
 
-> **테이블 이름**: SPEC의 컬럼 그대로지만 이름은 `outbox_polling`이다. 로컬 compose에서는 03과 04가 같은 DB(public 스키마)를 쓰는데,
-> 04의 Debezium 커넥터가 `public.outbox`(Debezium 기본 컬럼명)를 보기 때문에 03이 그 이름을 차지하면 04가 깨진다.
-> (Go 03은 별도 스키마 `go_03`으로 피한다.) 예전 버전의 03을 compose DB에 돌린 적이 있다면 `DROP TABLE outbox;` 후 04를 실행할 것.
+> **테이블 이름**: SPEC의 컬럼 그대로지만 이름은 `outbox_polling`이다. 지금은 03의 테이블이 전부 스키마 `k03`에 있어서
+> 04의 Debezium 커넥터가 보는 `public.outbox`와 겹칠 일이 없지만, 단계별 스키마가 생기기 전(03과 04가 같은 public을 쓰던 때)에
+> 이름 충돌을 피하려고 바꾼 이름이고, polling용(`published_at` 있음)과 CDC용을 구분하기 좋아 그대로 둔다.
+> 예전 버전의 03을 compose DB에 돌린 적이 있다면 public에 남은 `payments`/`outbox`를 `DROP TABLE` 한 뒤 04를 실행할 것.
+> 로컬 compose DB에서 들여다볼 때는 `SET search_path TO k03;` (예: `SELECT count(*) FROM outbox_polling WHERE published_at IS NULL;`).
 
 ## 테스트 실행
 
@@ -54,7 +56,7 @@ cd kotlin
 | `broker_down__payment_saved__event_delivered_after_recovery` | 브로커 장애 중엔 outbox에 남고, 복구 후 정확히 1건 전달 (01의 유실 해결). `message_id`/`event_type` 헤더 확인 |
 | `two_relays_concurrently__each_event_published_once` | relay 2개가 동시에 40건 발행: 두 relay 모두 1건 이상 맡고(정확히 반반은 아님), 합계 40·message_id 40종 = 중복 0 |
 | `crash_after_publish_before_mark__event_published_twice` | 발행 후 커밋 전 크래시 → 같은 message_id로 2번 발행 (at-least-once) |
-| `schema__does_not_collide_with_04_cdc_outbox_table` | 03을 돌린 DB에 04 스키마를 적용해도 04의 outbox insert가 된다 (테이블 이름 충돌 없음) |
+| `schema__does_not_collide_with_04_cdc_outbox_table` | 03을 돌린 DB에 04 스키마를 04처럼(search_path=public) 적용해도 04의 outbox insert가 된다 (03은 k03, 04는 public) |
 
 > 직접 확인 (`OutboxRepository.kt`의 잠금 절을 바꿔 가며 `two_relays...` 테스트를 돌려 보기):
 > - `SKIP LOCKED`만 지우면(`FOR UPDATE`는 유지) 테스트는 **통과**한다. 두 번째 relay가 첫 번째의 커밋을 **기다릴** 뿐 중복은 없다

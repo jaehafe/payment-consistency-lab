@@ -41,14 +41,16 @@ class PaymentRepository(private val jdbc: JdbcTemplate) {
     fun compareAndSetStatus(
         id: UUID, from: PaymentStatus, to: PaymentStatus,
         pgTxId: String?, lastError: String?, nextRetryAt: Instant?,
+        attemptCount: Int? = null, // null = 그대로 둔다
     ): Int = jdbc.update(
         """
         UPDATE payments
         SET status = ?, pg_tx_id = coalesce(?, pg_tx_id), last_error = coalesce(?, last_error),
-            next_retry_at = ?, updated_at = now()
+            next_retry_at = ?, attempt_count = coalesce(?, attempt_count), updated_at = now()
         WHERE id = ? AND status = ?
         """.trimIndent(),
-        to.name, pgTxId, lastError, nextRetryAt?.let(Timestamp::from), id, from.name,
+        to.name, pgTxId, lastError, nextRetryAt?.let(Timestamp::from), attemptCount,
+        id, from.name,
     )
 
     fun insertHistory(paymentId: UUID, from: PaymentStatus?, to: PaymentStatus, reason: String?) {
@@ -83,6 +85,36 @@ class PaymentRepository(private val jdbc: JdbcTemplate) {
             mapper,
             Timestamp.from(leaseUntil), status.name, Timestamp.from(now), limit,
         )
+
+    /**
+     * 오래된 PENDING을 집는다 (서버가 PG 호출 도중 죽은 결제 후보).
+     * claimDue와 같은 claim(SKIP LOCKED + lease + attempt_count +1)이고
+     * 고르는 조건만 다르다.
+     * - created_at <= createdBefore: 진행 중인 요청과 경쟁하지 않게
+     *   일정 시간이 지난 것만 (killbill의 createdDateBefore cutoff).
+     * - PENDING엔 next_retry_at이 없다(NULL). 집으면 lease 시각이
+     *   들어가므로, lease가 지나기 전엔 다시 집지 않는다.
+     */
+    fun claimStalePending(
+        createdBefore: Instant, now: Instant, leaseUntil: Instant, limit: Int,
+    ): List<Payment> = jdbc.query(
+        """
+        UPDATE payments
+           SET next_retry_at = ?, attempt_count = attempt_count + 1
+        WHERE id IN (
+          SELECT id FROM payments
+          WHERE status = 'PENDING' AND created_at <= ?
+            AND (next_retry_at IS NULL OR next_retry_at <= ?)
+          ORDER BY created_at
+          LIMIT ?
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+        """.trimIndent(),
+        mapper,
+        Timestamp.from(leaseUntil), Timestamp.from(createdBefore),
+        Timestamp.from(now), limit,
+    )
 
     /** 상태는 그대로 두고 다음 확인 시각만 미룬다 (CAS: 그 사이 상태가 바뀌었으면 0행) */
     fun scheduleRetry(id: UUID, expected: PaymentStatus, attemptCount: Int, nextRetryAt: Instant, lastError: String): Int =

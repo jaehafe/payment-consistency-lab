@@ -5,7 +5,8 @@
 #
 # It never runs `docker compose down` and never removes containers: the compose stack is shared.
 # Each stage uses its own database (e2e_<lang><NN>) and its own Kafka topic, so stages do not see
-# each other's rows or messages.
+# each other's rows or messages. Inside e2e_kNN the Kotlin app puts its tables in schema kNN;
+# psql_q/psql_f set that search_path automatically (schema_for_db).
 
 set -euo pipefail
 
@@ -84,11 +85,23 @@ ensure_infra() {
   die "postgres/redpanda not ready"
 }
 
+# Kotlin stage NN keeps its tables in schema kNN (spring.datasource.hikari.schema, see docs/SPEC.md).
+# schema_for_db DB -> kNN for the Kotlin scratch DBs (e2e_kNN, e2e_kNN_<suffix>), public for anything else
+# (the Go DBs: Go cmds pick their own go_NN schema and the scripts qualify those tables explicitly).
+schema_for_db() {
+  if [[ "$1" =~ ^e2e_k([0-9][0-9])(_|$) ]]; then echo "k${BASH_REMATCH[1]}"; else echo public; fi
+}
+
+# psql in the postgres container with search_path = schema_for_db DB, so the SQL in the stage scripts
+# needs no kNN. prefix. public is deliberately NOT appended: if the app ever created its tables in public
+# again, every query here would fail with "relation does not exist" instead of silently passing.
+_psql() { local db="$1"; shift; compose exec -T -e PGOPTIONS="-c search_path=$(schema_for_db "$db")" postgres psql -U lab -d "$db" "$@"; }
+
 # psql_q DB "SQL"  -> unaligned, tuples only, runs inside the postgres container
-psql_q() { compose exec -T postgres psql -U lab -d "$1" -v ON_ERROR_STOP=1 -qtAX -c "$2"; }
+psql_q() { _psql "$1" -v ON_ERROR_STOP=1 -qtAX -c "$2"; }
 
 # psql_f DB [psql args...] < file   -> runs a script from stdin
-psql_f() { local db="$1"; shift; compose exec -T postgres psql -U lab -d "$db" -v ON_ERROR_STOP=1 -X "$@"; }
+psql_f() { local db="$1"; shift; _psql "$db" -v ON_ERROR_STOP=1 -X "$@"; }
 
 # reset_db NAME - drops and recreates a scratch database. Only e2e_* names are allowed.
 reset_db() {

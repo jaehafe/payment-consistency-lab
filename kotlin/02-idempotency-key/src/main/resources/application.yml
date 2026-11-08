@@ -5,6 +5,11 @@ spring:
     url: jdbc:postgresql://localhost:15432/lab
     username: lab
     password: lab
+    hikari:
+      # 이 단계의 테이블은 스키마 k02에 둔다 — compose DB `lab`을 다른 단계와 같이 써도 안 섞이게 (docs/SPEC.md "스키마 규칙").
+      # Hikari가 커넥션마다 setSchema → pgjdbc가 `SET search_path TO 'k02'` → schema.sql·JdbcTemplate 모두 접두어 없이 k02만 본다.
+      # URL의 ?currentSchema= 와 달리 @ServiceConnection(테스트)·--spring.datasource.url(e2e)이 URL을 바꿔도 남는다.
+      schema: k02
   sql:
     init:
       mode: always

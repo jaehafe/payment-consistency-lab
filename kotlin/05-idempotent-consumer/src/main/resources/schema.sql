@@ -1,3 +1,7 @@
+-- 이 단계의 테이블은 스키마 k05에 만든다. 커넥션의 search_path 는 application.yml 의
+-- spring.datasource.hikari.schema=k05 가 맞춰 두므로 아래 DDL에는 스키마 접두어가 없다.
+CREATE SCHEMA IF NOT EXISTS k05;
+
 -- 이 단계는 결제 서비스가 아니라 payment.events를 "받는 쪽"(주문/포인트 서비스)이다.
 CREATE TABLE IF NOT EXISTS orders (
   id          TEXT PRIMARY KEY,

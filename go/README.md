@@ -60,7 +60,7 @@ import 할 때는 별칭을 붙인다: `outboxpolling "github.com/jaehafe/paymen
 - `go run ./07-payment-state-machine/cmd` — janitor 주기 실행 `Janitor.Run` (스키마 `go_07`, `JANITOR_INTERVAL` 기본 `10s`). Ctrl+C 로 종료
 - `go run ./10-observability/cmd` — `:8091` 결제 서버 + `/metrics` + `/admin/faults` (스키마 `go_10`). `--profile obs` 의 Prometheus 가 스크레이프. 런북은 `10-observability/README.md`
 
-02/03/10 이 별도 스키마를 쓰는 이유: 같은 DB 에서 03 의 `outbox`(폴링용 컬럼)와 04 의 `outbox`(Debezium 컬럼)가 충돌하지 않게, 그리고 Kotlin 앱과 테이블이 섞이지 않게.
+02/03/07/10 이 별도 스키마(`go_NN`)를 쓰는 이유: 같은 DB 에서 03 의 `outbox`(폴링용 컬럼)와 04 의 `outbox`(Debezium 컬럼)가 충돌하지 않게, 그리고 Kotlin 앱(단계별 스키마 `k01`~`k10`, 04 만 `public`)과 테이블이 섞이지 않게. 규칙은 `docs/SPEC.md` "스키마 규칙".
 환경 변수 `DATABASE_URL`(기본 `postgres://lab:lab@localhost:15432/lab?sslmode=disable`), `KAFKA_BROKERS`(기본 `localhost:19092`)로 바꿀 수 있다.
 
 ---

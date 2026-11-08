@@ -5,6 +5,11 @@ spring:
     url: jdbc:postgresql://localhost:15432/lab
     username: lab
     password: lab
+    hikari:
+      # 이 단계의 테이블은 스키마 k05에 둔다 — compose DB `lab`을 다른 단계와 같이 써도 안 섞이게 (docs/SPEC.md "스키마 규칙").
+      # Hikari가 커넥션마다 setSchema → pgjdbc가 `SET search_path TO 'k05'` → schema.sql·JdbcTemplate 모두 접두어 없이 k05만 본다.
+      # URL의 ?currentSchema= 와 달리 @ServiceConnection(테스트)·--spring.datasource.url(e2e)이 URL을 바꿔도 남는다.
+      schema: k05
   sql:
     init:
       mode: always
@@ -21,3 +26,14 @@ lab:
   consumer:
     enabled: true            # 테스트에서는 false로 끄고 ConsumerLoop를 직접 돌린다
     group-id: point-service
+    dlt:
+      # retryable 실패(깨진 JSON, 모르는 예외)가 이 횟수에 닿으면 <topic>-dlt 로 보내고 넘어간다.
+      # message_id 누락은 1번 만에, DB·네트워크 장애(transient)는 DLT 로 보내지 않는다 (FailureClassifier).
+      # 컨슈머 인스턴스별 메모리 카운트: 재시작·리밸런스하면 0 부터 다시 센다.
+      # (Spring Kafka DefaultErrorHandler 기본값은 10 = 첫 시도 + 재시도 9)
+      max-attempts: 3
+    retry:
+      # 실패가 이어지면 initial-delay, 2배, 4배, ... max-delay 까지 늘려 기다린다 (지수 백오프).
+      # transient 장애는 이 간격으로 끝없이 재시도한다.
+      initial-delay: 1s
+      max-delay: 30s

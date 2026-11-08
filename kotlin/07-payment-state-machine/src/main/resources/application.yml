@@ -5,6 +5,11 @@ spring:
     url: jdbc:postgresql://localhost:15432/lab
     username: lab
     password: lab
+    hikari:
+      # 이 단계의 테이블은 스키마 k07에 둔다 — compose DB `lab`을 다른 단계와 같이 써도 안 섞이게 (docs/SPEC.md "스키마 규칙").
+      # Hikari가 커넥션마다 setSchema → pgjdbc가 `SET search_path TO 'k07'` → schema.sql·JdbcTemplate 모두 접두어 없이 k07만 본다.
+      # URL의 ?currentSchema= 와 달리 @ServiceConnection(테스트)·--spring.datasource.url(e2e)이 URL을 바꿔도 남는다.
+      schema: k07
   sql:
     init:
       mode: always
@@ -16,4 +21,5 @@ lab:
     max-attempts: 5          # 이만큼 확인해도 확정 못 하면 MANUAL_REVIEW (사람이 확인)
     base-backoff: 10s        # 10s, 20s, 40s, 80s ... 지수 백오프
     not-found-grace: 5m      # PG에 기록이 없어도 이 시간 동안은 FAILED로 단정하지 않는다
+    pending-after: 2m        # 이보다 오래된 PENDING만 janitor가 PG에 조회 (진행 중인 요청과 경쟁하지 않게)
     lease: 1m                # 집어 간 행을 다른 janitor가 다시 집지 않도록 미뤄 두는 시간

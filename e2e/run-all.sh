@@ -23,9 +23,9 @@ STAGES=(
   "10|10-observability.sh --quick"
 )
 
-want() {
-  [[ $# -eq 0 ]] && return 0
+want() {   # want N [selected...] - true if no stage was selected on the command line, or N is one of them
   local n="$1"; shift
+  [[ $# -eq 0 ]] && return 0
   for s in "$@"; do [[ "$s" == "$n" ]] && return 0; done
   return 1
 }

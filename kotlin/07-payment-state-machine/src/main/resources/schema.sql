@@ -1,3 +1,7 @@
+-- 이 단계의 테이블은 스키마 k07에 만든다. 커넥션의 search_path 는 application.yml 의
+-- spring.datasource.hikari.schema=k07 가 맞춰 두므로 아래 DDL에는 스키마 접두어가 없다.
+CREATE SCHEMA IF NOT EXISTS k07;
+
 CREATE TABLE IF NOT EXISTS payments (
   id              UUID PRIMARY KEY,
   order_id        TEXT NOT NULL UNIQUE,
@@ -14,6 +18,9 @@ CREATE TABLE IF NOT EXISTS payments (
 -- janitor 조회용: 처리 대기 중인 상태만 담는 부분 인덱스
 CREATE INDEX IF NOT EXISTS payments_janitor_idx ON payments (next_retry_at)
   WHERE status IN ('UNKNOWN', 'CANCEL_REQUESTED');
+-- 오래된 PENDING 조회용 (PENDING엔 next_retry_at이 없어 created_at으로 고른다)
+CREATE INDEX IF NOT EXISTS payments_pending_idx ON payments (created_at)
+  WHERE status = 'PENDING';
 
 -- 모든 상태 전이의 감사 로그. "왜 이 결제가 이 상태인가?"에 답할 수 있어야 한다.
 CREATE TABLE IF NOT EXISTS payment_status_history (

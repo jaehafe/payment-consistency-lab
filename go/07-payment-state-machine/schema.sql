@@ -25,3 +25,7 @@ CREATE TABLE IF NOT EXISTS payment_status_history (
 -- janitor 가 "UNKNOWN 이고 재시도 시각이 된 것"만 빠르게 찾도록 하는 부분 인덱스
 CREATE INDEX IF NOT EXISTS payments_retry_idx ON payments (next_retry_at)
   WHERE status IN ('UNKNOWN', 'CANCEL_REQUESTED');
+
+-- 오래된 PENDING 조회용 (PENDING 엔 next_retry_at 이 없어 created_at 으로 고른다)
+CREATE INDEX IF NOT EXISTS payments_pending_idx ON payments (created_at)
+  WHERE status = 'PENDING';

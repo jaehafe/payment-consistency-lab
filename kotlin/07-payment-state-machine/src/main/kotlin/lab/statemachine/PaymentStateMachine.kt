@@ -25,11 +25,14 @@ class PaymentStateMachine(
         pgTxId: String? = null,
         lastError: String? = null,
         nextRetryAt: Instant? = null,
+        attemptCount: Int? = null,
     ) {
         if (!from.canTransitionTo(to)) throw IllegalTransitionException(from, to)
 
         tx.executeWithoutResult {
-            val updated = payments.compareAndSetStatus(id, from, to, pgTxId, lastError, nextRetryAt)
+            val updated = payments.compareAndSetStatus(
+                id, from, to, pgTxId, lastError, nextRetryAt, attemptCount,
+            )
             // 0행 = 현재 상태가 from이 아니다 → 다른 스레드/서버가 먼저 전이시켰다. 덮어쓰지 않고 실패시킨다.
             if (updated == 0) throw StaleStateException(id, from)
             payments.insertHistory(id, from, to, reason)

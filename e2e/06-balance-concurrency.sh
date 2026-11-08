@@ -12,8 +12,8 @@ reset_db "$DB"
 rc="$(run_kotlin_fg 06-balance-concurrency k06-1 90 --spring.datasource.url="$(jdbc_url $DB)")"
 check "app context started" grep -q "Started BalanceApplication" "$E2E_LOG_DIR/k06-1.log"
 check_eq "app exits by itself with code 0 (no web/scheduler/runner)" 0 "$rc"
-check_eq "schema applied: accounts, withdrawals" "accounts,withdrawals" \
-  "$(psql_q $DB "SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public'")"
+check_eq "schema applied in k06: accounts, withdrawals" "accounts,withdrawals" \
+  "$(psql_q $DB "SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='k06'")"
 check_eq "accounts has no CHECK (balance >= 0) - intentional, so the naive race can overdraw" 0 \
   "$(psql_q $DB "SELECT count(*) FROM pg_constraint WHERE conrelid='accounts'::regclass AND contype='c'")"
 

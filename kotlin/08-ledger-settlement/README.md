@@ -59,8 +59,9 @@ cd kotlin
 | `payout__merchant_payable_zero_after_payout` | 지급 후 미지급금 0, 통장 잔액 = 수수료 수익, 이중 지급 불가 |
 | `trial_balance__sum_of_balances_is_zero` | 시산표 합계 0, 캐시 잔액 = 라인 합계 |
 
-시산표 쿼리 (직접 실행용):
+시산표 쿼리 (직접 실행용. 로컬 compose DB에서는 Kotlin 08의 테이블이 스키마 `k08`에 있으므로 `SET search_path TO k08;` 먼저):
 ```sql
+SET search_path TO k08;
 SELECT a.id, a.type, a.balance, sum(l.debit) - sum(l.credit) AS lines_balance
 FROM ledger_accounts a LEFT JOIN ledger_lines l ON l.account_id = a.id
 GROUP BY a.id, a.type, a.balance ORDER BY a.id;

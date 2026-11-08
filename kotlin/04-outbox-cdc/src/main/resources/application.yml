@@ -6,6 +6,10 @@ spring:
     url: jdbc:postgresql://localhost:15432/lab
     username: lab
     password: lab
+    # 다른 Kotlin 단계와 달리 hikari.schema(k04)를 두지 않는다 → public 스키마 그대로.
+    # Debezium 커넥터(infra/debezium/outbox-connector.json)의 table.include.list 가 `public.outbox` 이고
+    # Go 04도 같은 public.outbox 에 쓴다 (커넥터 하나가 두 언어의 outbox를 같이 발행). k04로 옮기면 커넥터 설정,
+    # 이미 등록된 커넥터(재등록 필요), Go 04, e2e/04-cdc.sh 를 같이 바꿔야 한다. public 에는 이 단계(와 Go 04)만 테이블을 만든다.
   sql:
     init:
       mode: always

@@ -46,8 +46,13 @@
 cd infra && docker compose up -d postgres
 cd ../kotlin && ./gradlew :09-reconciliation:bootRun     # 테이블 생성 (곧바로 종료됨)
 psql -h localhost -p 15432 -U lab lab -v business_date="'2026-11-07'"
+lab=> SET search_path TO k09;
 lab=> \i 09-reconciliation/src/main/resources/recon_queries.sql
 ```
+
+Kotlin 09의 테이블은 스키마 `k09`에 있다 (`application.yml`의 `spring.datasource.hikari.schema`). 앱은 커넥션마다 search_path를 `k09`로 맞추므로
+`recon_queries.sql`에는 스키마 접두어가 없다 → psql에서도 `SET search_path TO k09;`를 먼저 해야 같은 테이블을 본다.
+(한 줄로: `PGOPTIONS='-c search_path=k09' psql -h localhost -p 15432 -U lab lab -v business_date="'2026-11-07'" -f 09-reconciliation/src/main/resources/recon_queries.sql`)
 
 psql도 `:변수` 문법을 쓰므로 앱이 쓰는 SQL 파일을 그대로 실행할 수 있다.
 (이건 **Kotlin 쪽 SQL 파일**에만 해당한다. Go 쪽 `go/09-reconciliation/recon_queries.sql`은 `$1` 플레이스홀더라 `\i`로 통째로 실행할 수 없다 — Go README 참고.)

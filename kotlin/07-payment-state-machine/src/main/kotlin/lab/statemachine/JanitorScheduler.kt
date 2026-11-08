@@ -38,7 +38,9 @@ class JanitorScheduler(private val janitor: Janitor) {
     private val log = LoggerFactory.getLogger(javaClass)
 
     /**
-     * 한 바퀴: UNKNOWN 확정 → 취소 재시도.
+     * 한 바퀴: 오래된 PENDING 정리 → UNKNOWN 확정 → 취소 재시도.
+     * PENDING을 먼저 본다: 판단 불가로 UNKNOWN에 넘긴 건은
+     * next_retry_at(백오프 뒤)이 정하는 바퀴에 UNKNOWN 쪽이 다시 본다.
      * 예외는 여기서 잡는다. (Spring도 반복 작업의 예외는 로그만 남기고
      * 다음 실행을 계속하지만, 한쪽 실패가 다른 쪽을 건너뛰게 하지 않고
      * 요약 로그를 남기기 위해 직접 잡는다. killbill도 항목별로
@@ -50,6 +52,9 @@ class JanitorScheduler(private val janitor: Janitor) {
     )
     fun run() {
         val now = Instant.now()
+        val pending = safely("sweepPending") {
+            janitor.sweepPending(now)
+        }
         val unknown = safely("reconcileUnknown") {
             janitor.reconcileUnknown(now)
         }
@@ -57,10 +62,11 @@ class JanitorScheduler(private val janitor: Janitor) {
             janitor.retryCancelRequested(now)
         }
         // 요약: 이번에 집어 간(확인한) 건수. 실패한 쪽은 error
-        val summary = "janitor run: unknown=${unknown ?: "error"}" +
+        val summary = "janitor run: pending=${pending ?: "error"}" +
+            " unknown=${unknown ?: "error"}" +
             " cancelRequested=${cancels ?: "error"}"
         // 할 일이 없던 바퀴는 DEBUG (주기마다 INFO면 로그가 넘친다)
-        val busy = (unknown ?: 1) > 0 || (cancels ?: 1) > 0
+        val busy = listOf(pending, unknown, cancels).any { (it ?: 1) > 0 }
         if (busy) log.info(summary) else log.debug(summary)
     }
 

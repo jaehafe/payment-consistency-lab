@@ -2,6 +2,7 @@ package statemachine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -20,12 +21,130 @@ type Janitor struct {
 	MaxAttempts   int           // 이 횟수만큼 확인해도 결론이 안 나면 MANUAL_REVIEW
 	BaseBackoff   time.Duration // 1차 재시도 간격. 이후 2배씩 (지수 백오프)
 	NotFoundGrace time.Duration // PG 에 기록이 없어도 이 시간 동안은 "아직 반영 전일 수 있다"고 보고 기다린다
+	PendingAfter  time.Duration // 이보다 오래된 PENDING 만 PG 에 조회한다 (0 이하면 SweepPending 이 거부)
 	BatchSize     int
+	PgCallTimeout time.Duration // PG 조회/취소 1회의 제한 시간 (0 이하면 5초)
 }
 
 // JanitorStats 는 한 번 실행한 결과.
 type JanitorStats struct {
 	Approved, Failed, ManualReview, Rescheduled, Canceled int
+	ToUnknown                                             int // PENDING → UNKNOWN 으로 넘긴 건
+}
+
+// SweepPending 은 오래된 PENDING 을 정리한다.
+// PENDING 을 커밋한 뒤 PG 응답을 기록하기 전에 프로세스가 죽으면
+// 결제가 PENDING 에 영원히 남는다. PendingAfter 보다 오래된 것만 집어
+// PG 에 묻는다 (진행 중인 요청과 경쟁하지 않게. killbill 의
+// createdDateBefore cutoff 와 같은 역할).
+//
+//   - APPROVED / FAILED → 바로 확정
+//   - NOT_FOUND → UNKNOWN 과 같은 grace 규칙. grace 가 지났으면
+//     FAILED, 아니면 UNKNOWN 으로 넘겨 grace 끝에 다시 본다 (안 셈)
+//   - 판단 불가(조회 장애) → UNKNOWN 으로 넘긴다 (1회로 셈).
+//     재시도·MANUAL_REVIEW 는 ReconcileUnknown 하나가 맡는다.
+func (j *Janitor) SweepPending(ctx context.Context, now time.Time) (JanitorStats, error) {
+	var stats JanitorStats
+	if j.PendingAfter <= 0 {
+		// 0 이면 방금 PENDING 이 된 (PG 응답을 기다리는) 결제까지 집는다
+		return stats, errors.New("janitor: PendingAfter must be > 0")
+	}
+	err := withTx(ctx, j.DB, func(tx pgx.Tx) error {
+		// ReconcileUnknown 과 같은 claim. 고르는 조건만 다르다:
+		// PENDING 엔 next_retry_at 이 없으므로 created_at 으로 고른다.
+		// 이 tx 가 끝날 때까지 행 잠금을 쥐므로, 그 사이 요청의 CAS 는
+		// 기다렸다가 0행(ErrStaleStatus)이 된다 → 여기선 Stale 이 없다.
+		rows, err := tx.Query(ctx, `
+			UPDATE payments SET attempt_count = attempt_count + 1
+			 WHERE id IN (
+			   SELECT id FROM payments
+			    WHERE status = 'PENDING' AND created_at <= $1
+			    ORDER BY created_at
+			    LIMIT $2
+			      FOR UPDATE SKIP LOCKED)
+			RETURNING id::text, idempotency_key, attempt_count,
+			          created_at`,
+			now.Add(-j.PendingAfter), j.batchSize())
+		if err != nil {
+			return err
+		}
+		// 컬럼 모양이 같아 unknownRow 를 그대로 쓴다
+		batch, err := pgx.CollectRows(rows, pgx.RowToStructByPos[unknownRow])
+		if err != nil {
+			return err
+		}
+
+		for _, p := range batch {
+			status, pgTxID, qerr := j.getStatus(ctx, p.Key)
+			switch {
+			case qerr == nil && status == PgApproved:
+				reason := "janitor: stale pending, pg says approved"
+				if err := TransitionTx(ctx, tx, p.ID, Pending, Approved, reason); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE payments SET pg_tx_id = $2, next_retry_at = NULL
+					 WHERE id = $1`, p.ID, pgTxID); err != nil {
+					return err
+				}
+				stats.Approved++
+
+			case qerr == nil && status == PgFailed:
+				reason := "janitor: stale pending, pg says failed"
+				if err := j.fail(ctx, tx, Pending, p.ID, reason); err != nil {
+					return err
+				}
+				stats.Failed++
+
+			case qerr == nil && status == PgNotFound:
+				graceEnd := p.CreatedAt.Add(j.NotFoundGrace)
+				if !now.Before(graceEnd) { // now >= graceEnd
+					// PG 에 도달하기 전에 죽었다. 돈은 안 빠졌다.
+					reason := "janitor: stale pending, no pg record after grace"
+					if err := j.fail(ctx, tx, Pending, p.ID, reason); err != nil {
+						return err
+					}
+					stats.Failed++
+					continue
+				}
+				// UNKNOWN 규칙과 같다: grace 안의 NOT_FOUND 는 시도로
+				// 세지 않고(-1) grace 끝 시각에 UNKNOWN 쪽이 다시 본다.
+				err := j.pendingToUnknown(ctx, tx, p.ID,
+					"pg not found (within grace)", graceEnd, p.Attempts-1)
+				if err != nil {
+					return err
+				}
+				stats.ToUnknown++
+
+			default:
+				// 결과를 모른다 = UNKNOWN. 이번 확인은 1회로 센다.
+				reason := fmt.Sprintf("inconclusive (status=%s, err=%v)",
+					status, qerr)
+				err := j.pendingToUnknown(ctx, tx, p.ID, reason,
+					now.Add(j.backoff(p.Attempts)), p.Attempts)
+				if err != nil {
+					return err
+				}
+				stats.ToUnknown++
+			}
+		}
+		return nil
+	})
+	return stats, err
+}
+
+// pendingToUnknown: 이후 재시도/보류는 ReconcileUnknown 이 맡는다.
+func (j *Janitor) pendingToUnknown(ctx context.Context, tx pgx.Tx,
+	id, reason string, next time.Time, attempts int) error {
+	reason = "janitor: stale pending - " + reason
+	if err := TransitionTx(ctx, tx, id, Pending, Unknown, reason); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE payments
+		   SET attempt_count = $2, last_error = $3, next_retry_at = $4
+		 WHERE id = $1`, id, attempts, reason, next)
+	return err
 }
 
 // maxBackoffShift 는 지수의 상한 (Kotlin 의 coerceAtMost(20) 과 같다).
@@ -81,7 +200,7 @@ func (j *Janitor) ReconcileUnknown(ctx context.Context, now time.Time) (JanitorS
 		}
 
 		for _, p := range batch {
-			status, pgTxID, qerr := j.Gateway.GetStatus(ctx, p.Key)
+			status, pgTxID, qerr := j.getStatus(ctx, p.Key)
 			switch {
 			case qerr == nil && status == PgApproved:
 				if err := TransitionTx(ctx, tx, p.ID, Unknown, Approved, "janitor: pg says approved"); err != nil {
@@ -93,7 +212,7 @@ func (j *Janitor) ReconcileUnknown(ctx context.Context, now time.Time) (JanitorS
 				stats.Approved++
 
 			case qerr == nil && status == PgFailed:
-				if err := j.fail(ctx, tx, p.ID, "janitor: pg says failed"); err != nil {
+				if err := j.fail(ctx, tx, Unknown, p.ID, "janitor: pg says failed"); err != nil {
 					return err
 				}
 				stats.Failed++
@@ -104,7 +223,7 @@ func (j *Janitor) ReconcileUnknown(ctx context.Context, now time.Time) (JanitorS
 					// 충분히 기다렸는데도 PG 에 기록이 없다
 					// → 요청이 PG 에 도달하지 못한 것. 돈은 안 빠졌다.
 					reason := "janitor: pg has no record after grace"
-					if err := j.fail(ctx, tx, p.ID, reason); err != nil {
+					if err := j.fail(ctx, tx, Unknown, p.ID, reason); err != nil {
 						return err
 					}
 					stats.Failed++
@@ -157,8 +276,8 @@ func (j *Janitor) ReconcileUnknown(ctx context.Context, now time.Time) (JanitorS
 	return stats, err
 }
 
-func (j *Janitor) fail(ctx context.Context, tx pgx.Tx, id, reason string) error {
-	if err := TransitionTx(ctx, tx, id, Unknown, Failed, reason); err != nil {
+func (j *Janitor) fail(ctx context.Context, tx pgx.Tx, from Status, id, reason string) error {
+	if err := TransitionTx(ctx, tx, id, from, Failed, reason); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `UPDATE payments SET last_error = $2, next_retry_at = NULL WHERE id = $1`, id, reason)
@@ -196,7 +315,7 @@ func (j *Janitor) RetryCancels(ctx context.Context, now time.Time) (JanitorStats
 		}
 		for _, p := range batch {
 			// PG 취소는 상태를 바꾸는 호출이지만 멱등하다(이미 취소된 건은 성공 처리). 그래서 재시도해도 안전하다.
-			if cerr := j.Gateway.Cancel(ctx, p.PgTxID); cerr != nil {
+			if cerr := j.cancel(ctx, p.PgTxID); cerr != nil {
 				attempts := p.Attempts // 집을 때 이미 +1
 				// 취소는 "포기"할 수 없다 (돈을 돌려줘야 하므로). 백오프하며 계속 재시도하고, 오래된 건은 알림으로 사람을 부른다.
 				if _, err := tx.Exec(ctx,
@@ -218,6 +337,32 @@ func (j *Janitor) RetryCancels(ctx context.Context, now time.Time) (JanitorStats
 		return nil
 	})
 	return stats, err
+}
+
+// getStatus / cancel 은 PG 호출 1회에 제한 시간을 건다.
+// janitor 는 행 잠금을 쥔 채 PG 를 부른다 (Go 는 claim 과 처리가 한 tx).
+// PG 가 응답하지 않으면 그 행을 기다리는 요청의 CAS 까지 같이 멈춘다.
+// 시간이 지나면 ctx 가 취소돼 에러(context.DeadlineExceeded)가 돌아오고,
+// 호출부는 다른 PG 장애와 똑같이 "판단 불가" 로 다룬다
+// (조회: UNKNOWN 백오프/MANUAL_REVIEW, 취소: 재예약 — 취소는 멱등이라
+// 실제로는 처리됐어도 다시 불러도 안전하다).
+func (j *Janitor) getStatus(ctx context.Context, key string) (PgStatus, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, j.pgCallTimeout())
+	defer cancel()
+	return j.Gateway.GetStatus(ctx, key)
+}
+
+func (j *Janitor) cancel(ctx context.Context, pgTxID string) error {
+	ctx, cancel := context.WithTimeout(ctx, j.pgCallTimeout())
+	defer cancel()
+	return j.Gateway.Cancel(ctx, pgTxID)
+}
+
+func (j *Janitor) pgCallTimeout() time.Duration {
+	if j.PgCallTimeout <= 0 {
+		return 5 * time.Second
+	}
+	return j.PgCallTimeout
 }
 
 func (j *Janitor) batchSize() int {
@@ -256,9 +401,16 @@ func (j *Janitor) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// runOnce 는 한 바퀴: UNKNOWN 확정 → 취소 재시도.
+// runOnce 는 한 바퀴: 오래된 PENDING 정리 → UNKNOWN 확정 → 취소 재시도.
 // 한쪽이 실패해도 다른 쪽은 실행한다 (서로 독립적인 작업).
+// PENDING 을 먼저 본다: 판단 불가로 UNKNOWN 에 넘긴 건은
+// next_retry_at(백오프 뒤)이 정하는 바퀴에 UNKNOWN 쪽이 다시 본다.
 func (j *Janitor) runOnce(ctx context.Context, now time.Time) {
+	p, perr := j.SweepPending(ctx, now)
+	if perr != nil && ctx.Err() == nil {
+		log.Printf("janitor: sweep pending 실패"+
+			" (다음 주기에 재시도): %v", perr)
+	}
 	u, uerr := j.ReconcileUnknown(ctx, now)
 	if uerr != nil && ctx.Err() == nil {
 		log.Printf("janitor: reconcile unknown 실패"+
@@ -271,10 +423,14 @@ func (j *Janitor) runOnce(ctx context.Context, now time.Time) {
 	}
 	// 실행 요약. 할 일이 없던 바퀴는 조용히 넘어간다
 	// (Go 표준 log 에는 DEBUG 레벨이 없다).
-	if u != (JanitorStats{}) || c != (JanitorStats{}) {
-		log.Printf("janitor run: unknown{approved=%d failed=%d"+
+	idle := JanitorStats{}
+	if p != idle || u != idle || c != idle {
+		log.Printf("janitor run:"+
+			" pending{approved=%d failed=%d toUnknown=%d}"+
+			" unknown{approved=%d failed=%d"+
 			" manualReview=%d rescheduled=%d}"+
 			" cancel{canceled=%d rescheduled=%d}",
+			p.Approved, p.Failed, p.ToUnknown,
 			u.Approved, u.Failed, u.ManualReview, u.Rescheduled,
 			c.Canceled, c.Rescheduled)
 	}

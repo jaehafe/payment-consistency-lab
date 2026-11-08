@@ -78,3 +78,32 @@ func waitUntil(t *testing.T, timeout time.Duration, cond func() bool) {
 	}
 	t.Fatalf("%s 안에 조건이 만족되지 않음", timeout)
 }
+
+func Test_run__settles_stale_pending_on_schedule(t *testing.T) {
+	f := newFixture(t)
+	// PENDING 커밋 → PG 승인 → 응답 기록 전에 죽었다 (3분 전)
+	p := insertPending(t, time.Now().Add(-3*time.Minute))
+	pgTxID, err := f.gateway.Charge(context.Background(),
+		p.key, p.id, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	// defer 는 역순 실행: cancel → <-done. 실패로 끝나도 Run 이 다음
+	// 테스트의 행을 건드리지 않게 끝날 때까지 기다린다.
+	defer func() { <-done }()
+	defer cancel()
+	go func() {
+		f.janitor.Run(ctx, 50*time.Millisecond)
+		close(done)
+	}()
+
+	waitUntil(t, 10*time.Second, func() bool {
+		return f.mustGet(t, p.id).Status == Approved
+	})
+	if got := f.mustGet(t, p.id); got.PgTxID != pgTxID {
+		t.Fatalf("pg_tx_id 기대 %s, 실제 %s", pgTxID, got.PgTxID)
+	}
+}

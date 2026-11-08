@@ -154,16 +154,18 @@ class OutboxPollingTest {
     }
 
     /**
-     * 03과 04는 로컬에서 같은 Postgres(infra/docker-compose.yml의 lab DB, public 스키마)를 쓴다.
-     * 04의 테이블은 Debezium 커넥터(table.include.list = public.outbox) 때문에 이름이 `public.outbox`로 고정이다.
-     * 03이 같은 이름으로 다른 컬럼의 테이블을 먼저 만들어 두면, 04의 `CREATE TABLE IF NOT EXISTS outbox`는
+     * 03과 04는 로컬에서 같은 Postgres(infra/docker-compose.yml의 lab DB)를 쓴다. 03은 스키마 k03,
+     * 04는 Debezium 커넥터(table.include.list = public.outbox) 때문에 public 에 테이블을 둔다.
+     * 03이 public 에 같은 이름(payments/outbox)으로 다른 컬럼의 테이블을 먼저 만들어 두면, 04의 `CREATE TABLE IF NOT EXISTS`는
      * 아무 일도 안 하고 넘어가고 04의 insert가 "column aggregatetype does not exist"로 깨진다.
-     * → 03을 돌린 DB에 04 스키마를 적용하고 04 방식의 insert가 되는지 확인한다. (DDL도 롤백되는 Postgres 트랜잭션 안에서)
+     * → 03을 돌린 DB에서 04의 커넥션처럼 search_path=public 으로 04 스키마를 적용하고 04 방식의 insert가 되는지 확인한다.
+     *   (DDL도 롤백되는 Postgres 트랜잭션 안에서. SET LOCAL 이라 커밋/롤백과 함께 원래 search_path(k03)로 돌아온다)
      */
     @Test
     fun schema__does_not_collide_with_04_cdc_outbox_table() {
         val cdcSchema = File("../04-outbox-cdc/src/main/resources/schema.sql").readText()
         tx.executeWithoutResult { status ->
+            jdbc.execute("SET LOCAL search_path TO public") // 04의 커넥션 = public
             jdbc.execute(cdcSchema)
             jdbc.update(
                 "INSERT INTO outbox (id, aggregatetype, aggregateid, type, payload) VALUES (?, 'payment', 'o', 'PaymentCompleted', '{}'::jsonb)",

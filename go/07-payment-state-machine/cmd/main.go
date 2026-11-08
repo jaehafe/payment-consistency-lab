@@ -55,14 +55,16 @@ func main() {
 	}
 
 	// Fake PG 는 메모리에만 기록을 들고 있다. 이 프로세스는 결제를
-	// 승인하지 않으므로, 밖에서 넣은 UNKNOWN 은 PG 조회 시 NOT_FOUND
-	// → grace 안이면 재예약, 지났으면 FAILED 가 된다.
+	// 승인하지 않으므로, 밖에서 넣은 UNKNOWN/PENDING 은 PG 조회 시
+	// NOT_FOUND → grace 안이면 재예약(PENDING 은 UNKNOWN 으로),
+	// 지났으면 FAILED 가 된다.
 	j := &statemachine.Janitor{
 		DB:            db,
 		Gateway:       statemachine.NewFakePaymentGateway(),
 		MaxAttempts:   5,
 		BaseBackoff:   10 * time.Second,
 		NotFoundGrace: 5 * time.Minute,
+		PendingAfter:  2 * time.Minute, // 이보다 오래된 PENDING 만 정리
 	}
 	log.Printf("janitor started (interval=%s, schema=go_07)", interval)
 	j.Run(ctx, interval) // ctx 가 취소될 때까지 블록

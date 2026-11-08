@@ -27,7 +27,8 @@ func newFixture(t *testing.T) fixture {
 		repo:    repo,
 		gateway: gw,
 		svc:     &PaymentService{Repo: repo, Gateway: gw},
-		janitor: &Janitor{DB: testPool, Gateway: gw, MaxAttempts: 3, BaseBackoff: time.Minute, NotFoundGrace: 5 * time.Minute},
+		janitor: &Janitor{DB: testPool, Gateway: gw, MaxAttempts: 3, BaseBackoff: time.Minute,
+			NotFoundGrace: 5 * time.Minute, PendingAfter: 2 * time.Minute},
 	}
 }
 

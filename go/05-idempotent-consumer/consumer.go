@@ -123,6 +123,15 @@ type ConsumerLoop struct {
 	Handler MessageHandler
 
 	CrashBeforeOffsetCommit bool // 실패 주입: DB 커밋 후 offset 커밋 전에 죽음
+
+	// nil 이면 DLT 없음: 실패한 메시지를 성공할 때까지 무한 재시도.
+	// 있으면 에러를 분류해서 (errclass.go) retryable 은 MaxAttempts 번째,
+	// not-retryable 은 1번 만에 DLT 로 보내고 넘어간다. transient(DB·네트워크
+	// 장애)는 DLT 로 보내지 않고 Run 이 백오프로 끝없이 재시도한다.
+	DeadLetter *DeadLetter
+
+	// Run 의 재시도 간격 상한. 0 이면 DefaultMaxRetryDelay(30초).
+	MaxRetryDelay time.Duration
 }
 
 // ErrMissingMessageID 는 message_id 헤더가 없는 메시지. 중복 제거 키가 없으니 처리할 수 없다.
@@ -135,11 +144,18 @@ var ErrSimulatedCrash = errors.New("consumer crashed before offset commit (simul
 type PollStats struct {
 	Processed int // 실제 처리
 	Skipped   int // 중복이라 건너뜀
+	// 재시도를 포기하고 DLT 로 보냄 (DeadLetter 가 있을 때만)
+	DeadLettered int
 }
 
 // PollOnce 는 한 번 가져온 레코드들을 처리하고 offset 을 커밋한다.
 func (l *ConsumerLoop) PollOnce(ctx context.Context) (PollStats, error) {
 	var stats PollStats
+	if l.DeadLetter != nil { // 리터럴로 만든 잘못된 설정을 첫 실패 전에 잡는다
+		if err := l.DeadLetter.Validate(); err != nil {
+			return stats, err
+		}
+	}
 	fetches := l.Client.PollFetches(ctx) // 레코드가 올 때까지(또는 ctx 취소까지) 기다린다
 	if err := ctx.Err(); err != nil {
 		return stats, err
@@ -156,10 +172,19 @@ func (l *ConsumerLoop) PollOnce(ctx context.Context) (PollStats, error) {
 	for i, rec := range recs {
 		processed, err := l.Handler.Handle(ctx, rec)
 		if err != nil {
+			dead, dlErr := l.deadLetterOrRetry(ctx, rec, err)
+			if dead { // DLT ack 받음 → 커밋 대상에 넣고 다음 레코드로
+				stats.DeadLettered++
+				continue
+			}
+			if dlErr != nil {
+				err = dlErr
+			}
 			// 실패한 메시지 "앞"까지만 커밋하고, 실패한 메시지부터
 			// 다시 받도록 되감는다. (아래 rewindFrom 설명 참고)
 			return stats, l.rewindFrom(ctx, recs, i, err)
 		}
+		l.DeadLetter.succeeded(rec) // nil 이어도 안전 (deadletter.go)
 		if processed {
 			stats.Processed++
 		} else {
@@ -179,6 +204,44 @@ func (l *ConsumerLoop) PollOnce(ctx context.Context) (PollStats, error) {
 		}
 	}
 	return stats, nil
+}
+
+// deadLetterOrRetry 는 처리 실패한 rec 을 어떻게 할지 정한다.
+// (Spring DefaultErrorHandler 가 하는 일)
+//
+//	(false, nil) 아직 재시도 (transient 는 언제나) → 호출자가 rec 부터 되감는다
+//	(true, nil)  DLT 발행 ack 받음 → rec 을 넘어 커밋해도 된다
+//	(false, err) DLT 발행 실패 → 커밋하지 않고 되감는다
+//
+// ★ DLT ack 를 받은 "뒤에만" rec 을 커밋 대상에 넣는다. 커밋을
+// 먼저 하고 DLT 발행이 실패하면 메시지는 어디에도 남지 않는다
+// (유실). 이 순서면 최악이 "DLT 에 두 번"이다 (at-least-once).
+func (l *ConsumerLoop) deadLetterOrRetry(
+	ctx context.Context, rec *kgo.Record, cause error,
+) (bool, error) {
+	d := l.DeadLetter
+	if d == nil {
+		return false, nil
+	}
+	n, class, giveUp := d.failed(rec, cause)
+	if class == classTransient {
+		log.Printf("인프라 장애(transient), DLT 대상 아님 — 백오프 후 재시도: %s-%d@%d: %v",
+			rec.Topic, rec.Partition, rec.Offset, cause)
+		return false, nil
+	}
+	if !giveUp {
+		log.Printf("처리 실패 %d/%d (%s), 재시도: %s-%d@%d: %v",
+			n, d.MaxAttempts, class, rec.Topic, rec.Partition, rec.Offset,
+			cause)
+		return false, nil
+	}
+	if err := d.publish(ctx, rec, cause, n); err != nil {
+		return false, errors.Join(cause, err)
+	}
+	log.Printf("DLT 로 보냄 (%s, 시도 %d번): %s-%d@%d → %s: %v",
+		class, n, rec.Topic, rec.Partition, rec.Offset, DLTTopic(rec.Topic),
+		cause)
+	return true, nil
 }
 
 // rewindFrom 은 recs[failed] 처리 실패 후 정리한다.
@@ -227,21 +290,46 @@ func (l *ConsumerLoop) rewindFrom(
 // Run 은 ctx 가 취소될 때까지 PollOnce 를 반복한다. (Kotlin ConsumerRunner)
 //
 // 실패하면 PollOnce 가 실패한 메시지부터 다시 받도록 되감아 두므로
-// 같은 클라이언트로 그대로 계속 돌면 된다. 같은 메시지가 계속 실패하면
-// (poison message) 여기서 무한히 재시도한다 → README "한계" 참고.
-func (l *ConsumerLoop) Run(ctx context.Context, retryDelay time.Duration) {
+// 같은 클라이언트로 그대로 계속 돌면 된다. 실패가 이어지면 기다리는 시간을
+// retryDelay, 2배, 4배, ... MaxRetryDelay(기본 30초) 까지 늘린다 (지수 백오프).
+// 성공하면 다시 retryDelay 부터.
+//   - DB 가 잠깐 죽었다면(transient) 몇 초~수십 초 간격으로 계속 두드리다
+//     살아나면 처리한다. 시도 횟수는 안 세므로 DLT 로 가지 않는다.
+//   - poison message 는 DeadLetter 가 있으면 MaxAttempts 번째에 DLT 로
+//     보내고 넘어가고, 없으면 여기서 무한히 재시도한다.
+//
+// 설정이 잘못됐으면(DeadLetter.Validate) 바로 에러를 돌려준다.
+// 그 외에는 ctx 가 취소될 때 ctx.Err() 를 돌려준다.
+func (l *ConsumerLoop) Run(ctx context.Context, retryDelay time.Duration) error {
+	if l.DeadLetter != nil {
+		if err := l.DeadLetter.Validate(); err != nil {
+			return err
+		}
+	}
+	if retryDelay <= 0 {
+		return fmt.Errorf("retryDelay must be > 0, got %v", retryDelay)
+	}
+	maxDelay := l.MaxRetryDelay
+	if maxDelay <= 0 {
+		maxDelay = DefaultMaxRetryDelay
+	}
+	failures := 0          // 연속 실패 횟수
 	for ctx.Err() == nil { // ctx 가 취소되면 Err() 가 nil 이 아니게 된다
 		_, err := l.PollOnce(ctx)
 		if err == nil || ctx.Err() != nil {
+			failures = 0
 			continue
 		}
-		log.Printf("처리 실패, %v 뒤 같은 메시지부터 재시도: %v",
-			retryDelay, err)
+		failures++
+		wait := retryBackoff(retryDelay, maxDelay, failures)
+		log.Printf("처리 실패 (연속 %d번), %v 뒤 같은 메시지부터 재시도: %v",
+			failures, wait, err)
 		select {
 		case <-ctx.Done():
-		case <-time.After(retryDelay):
+		case <-time.After(wait):
 		}
 	}
+	return ctx.Err()
 }
 
 // ---- 헬퍼 ----

@@ -119,7 +119,7 @@ Prometheus `http://localhost:9090/alerts`에서 알림 상태, Graph 탭에서 �
    ```bash
    grep '^{' /tmp/obs.log | jq -c 'select(.message|startswith("PG 응답 불명")) | {request_id, payment_id, order_id, message}' | tail
    ```
-   그리고 DB에서: `SELECT count(*), min(created_at) FROM payments WHERE status = 'UNKNOWN';`
+   그리고 DB에서 (Kotlin 10의 테이블은 스키마 `k10`): `SELECT count(*), min(created_at) FROM k10.payments WHERE status = 'UNKNOWN';`
 4. **판단**: UNKNOWN은 "실패"가 아니다 — 대부분 실제로는 승인됐다 (07). **환불하거나 재결제를 유도하지 말 것.** PG 조회 API로 janitor가 확정하게 두고, PG 장애가 길어지면 MANUAL_REVIEW 목록과 다음 날 정산 파일 대사(09, `MISSING_IN_INTERNAL`)로 정리한다. `payment_unknown_current`가 PG 복구 후에도 줄지 않으면 janitor 정지를 의심한다.
 
 ### 시나리오 C — 중복 요청 폭주
