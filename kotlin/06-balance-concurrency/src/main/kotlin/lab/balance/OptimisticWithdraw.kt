@@ -18,6 +18,7 @@ class OptimisticWithdraw(
     private val accounts: AccountRepository,
 ) : WithdrawStrategy {
     @Volatile var readWriteDelayMs = 0L
+    /** 첫 시도를 "포함한" 총 시도 횟수. 20이면 첫 시도 1 + 재시도 최대 19. (Go `MaxAttempts`와 같은 의미) */
     var maxAttempts = 20
 
     /** 테스트 관찰용: 버전 충돌로 재시도한 총 횟수 */

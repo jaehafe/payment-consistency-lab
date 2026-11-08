@@ -14,12 +14,24 @@
 
 1. PG 정산 CSV(`pg_tx_id,order_id,type,amount,fee,transacted_at`)를 `pg_settlement_records` 로 import.
    파일 내용의 **SHA-256** 을 `recon_files.file_hash UNIQUE` 로 기록 → 같은 파일이 다시 와도(이름이 바뀌어도) 무시.
-2. `recon_queries.sql` 의 이름 붙은 쿼리로 비교 (대상 기간 = KST business_date):
+   해시는 원본 바이트가 아니라 정규화한 내용(BOM 제거, CRLF·CR→LF, 줄 앞뒤 공백 trim, 빈 줄 제거 — Kotlin 과 같음)으로 내고 파싱도 그 결과로 한다 → CRLF 로 다시 저장되거나 끝 개행·줄 끝 공백이 붙은 재전송도 같은 파일로 본다.
+   (`encoding/csv` 가 똑같이 읽는 차이만 지운다. 따옴표 필드 `"a,b"` 는 `encoding/csv` 가 처리한다.)
+2. `recon_queries.sql` 의 이름 붙은 쿼리로 비교 (대상 기간 = KST business_date 하루 `[00:00, 다음날 00:00)`, `date::timestamp AT TIME ZONE 'Asia/Seoul'` 로 만든 반열린 구간이라 컬럼을 함수로 감싸지 않는다 → 시각 컬럼에 인덱스를 추가하면 쓸 수 있다. 학습용 스키마엔 인덱스 없음):
    - `compare_by_pg_tx_id`: `FULL OUTER JOIN ... ON pg_tx_id` → 한쪽에만 있으면 MISSING_*, 금액이 다르면 AMOUNT_MISMATCH
    - `duplicate_in_pg` / `duplicate_in_internal`: `GROUP BY pg_tx_id HAVING count(*) > 1`
 3. 결과를 `recon_results` 에 저장하고 `ReconReport`(종류별 건수, 차액 합계, 일치 건수) + Markdown 리포트를 만든다.
 
-**SQL 은 `recon_queries.sql` 에 따로 있다.** Go 코드를 몰라도 이 파일만 읽고 psql 에서 `$1` 을 `'2026-11-08'` 로 바꿔 바로 실행해볼 수 있다.
+**SQL 은 `recon_queries.sql` 에 따로 있다.** Go 코드를 몰라도 이 파일만 읽고 psql 에서 실행해볼 수 있다.
+단 `$1` 은 psql 변수가 아니라서 Kotlin 처럼 `\i` 로 파일째 실행할 수는 없다. 쿼리 하나를 복사해서:
+
+```sql
+-- 방법 1: $1 을 날짜 리터럴로 바꿔 붙여넣기 ($1::date → '2026-11-08'::date)
+-- 방법 2: 본문을 그대로 PREPARE 에 넣기
+PREPARE cmp(date) AS <compare_by_pg_tx_id 본문>;
+EXECUTE cmp('2026-11-08');
+```
+
+Go 09 에는 실행용 `cmd` 가 없어서 테이블은 테스트 컨테이너에만 생긴다. 로컬 compose DB(`psql -h localhost -p 15432 -U lab lab`)에서 해보려면 `\i schema.sql` 을 먼저 실행한다 (Kotlin 09 와 같은 테이블 정의다).
 
 | kind | 의미 | diff_amount (= PG - 내부) | 흔한 원인 / 조치 |
 |---|---|---|---|
@@ -31,10 +43,10 @@
 
 ## 핵심 코드 위치
 
-- `recon_queries.sql:18` `compare_by_pg_tx_id` — `:26,32` `DISTINCT ON` (중복이 JOIN 결과를 부풀리지 않게), `:48` `FULL OUTER JOIN`
-- `recon_queries.sql:51` `duplicate_in_pg`, `:65` `duplicate_in_internal` — `HAVING count(*) > 1`
+- `recon_queries.sql:25` `compare_by_pg_tx_id` — `:32` KST 하루 범위(`day` CTE), `:37,43` `DISTINCT ON` (중복이 JOIN 결과를 부풀리지 않게), `:59` `FULL OUTER JOIN`
+- `recon_queries.sql:62` `duplicate_in_pg`, `:80` `duplicate_in_internal` — `HAVING count(*) > 1`
 - `queries.go:12` `//go:embed recon_queries.sql`, `:20` `-- name:` 파서
-- `importer.go:39` `Import` — `:40` SHA-256, `:58` 같은 파일 무시, `:72` `CopyFrom`(COPY 프로토콜 대량 insert), `:93` `encoding/csv` 파싱
+- `importer.go:41` `Import` — `:45` 정규화(`:100` `normalizeCSV`: 줄바꿈·줄 끝 공백·빈 줄) 후 SHA-256, 파싱도 같은 입력, `:66` 같은 파일 무시, `:78` `CopyFrom`(COPY 프로토콜 대량 insert), `:121` `encoding/csv` 파싱
 - `service.go:55` `Run`, `service.go:105` `Markdown`
 - `testdata/pg_settlement_2026-11-08.csv` — PG 정산 파일 fixture
 
@@ -54,11 +66,13 @@ go test ./09-reconciliation/ -v     # 마지막 테스트가 Markdown 리포트�
 | `Test_duplicate_in_pg_file__detected` | PG 파일에 같은 거래 2줄 → 초과분 +10,000, 금액 비교는 1건으로 일치 |
 | `Test_duplicate_internal__detected` | 내부에 같은 거래 2줄 → 초과분 -10,000 |
 | `Test_same_file_imported_twice__ignored` | 이름만 바꾼 같은 파일 → skip, 레코드 7행 그대로 |
+| `Test_same_file_with_different_line_endings__ignored` | CRLF + 줄 끝 공백 + 끝 개행 하나 더인 같은 파일 → skip, 레코드 7행 그대로 |
+| `Test_kst_day_boundary__only_records_inside_day_counted` | 내부는 KST 00:00:00(포함)·PG 는 1초 전 → MISSING_IN_PG / 내부는 다음날 00:00:00(제외)·PG 는 1초 전 → MISSING_IN_INTERNAL |
 | `Test_report__summarizes_counts_and_diff_amount` | fixture 로 5종류 각 1건, 일치 4건, 차액 합 -13,000 / 절대값 합 45,000, 전날 거래 제외 |
 
 ## 한계 / 다음 단계
 
 - **날짜 경계**: 23:59:59 거래가 우리는 오늘, PG 는 내일로 잡을 수 있다. 실무에서는 MISSING 건을 전후일 데이터와 한 번 더 맞춰보거나 1~2일 지연 대사를 한다.
 - 지금은 `pg_tx_id` + 금액만 비교한다. 거래 유형(PAYMENT/REFUND), 수수료(`fee`), 주문 ID 불일치도 같은 방식으로 확장할 수 있다.
-- 쿼리의 `(시각 AT TIME ZONE 'Asia/Seoul')::date = $1` 은 읽기 쉽지만 인덱스를 못 탄다. 데이터가 크면 KST 자정 범위 조건(`>= 시작 AND < 끝`)으로 바꾼다.
+- 해시 정규화는 줄바꿈 종류, 줄 앞뒤 공백, 빈 줄, BOM 만 지운다. 행 순서가 바뀐 재전송은 다른 파일로 보고 전 건이 DUPLICATE_IN_PG 가 된다 → 실무에선 PG 파일의 일련번호/정산일 같은 메타데이터로도 막는다.
 - 대사는 **탐지**까지다. 보정(내부 기록 추가, 역분개)은 사람이 확인한 뒤 별도 절차로 한다. 자동 보정은 잘못되면 피해를 키운다.

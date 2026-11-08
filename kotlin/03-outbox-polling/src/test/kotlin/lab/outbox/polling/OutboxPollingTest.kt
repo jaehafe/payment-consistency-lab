@@ -15,6 +15,7 @@ import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.kafka.KafkaException
 import org.springframework.transaction.support.TransactionTemplate
 import org.testcontainers.redpanda.RedpandaContainer
+import java.io.File
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Callable
@@ -40,7 +41,7 @@ class OutboxPollingTest {
 
     @BeforeEach
     fun cleanTables() {
-        jdbc.execute("TRUNCATE outbox, payments")
+        jdbc.execute("TRUNCATE outbox_polling, payments")
     }
 
     @AfterEach
@@ -59,7 +60,7 @@ class OutboxPollingTest {
 
         assertEquals(1, payments.countByOrderId(orderId))
         val row = jdbc.queryForMap(
-            "SELECT aggregate_type, event_type, payload::text AS payload, published_at FROM outbox WHERE aggregate_id = ?",
+            "SELECT aggregate_type, event_type, payload::text AS payload, published_at FROM outbox_polling WHERE aggregate_id = ?",
             orderId,
         )
         assertEquals("payment", row["aggregate_type"])
@@ -100,6 +101,7 @@ class OutboxPollingTest {
         val events = probe.eventsFor(orderId)
         assertEquals(1, events.size, "복구 후 relay가 밀린 이벤트를 전달했다 — 01의 '이벤트 유실'이 해결됨")
         assertEquals(outboxId(orderId), events.single().messageId)
+        assertEquals("PaymentCompleted", events.single().eventType, "event_type 헤더 (04의 Debezium도 같은 헤더를 붙인다)")
     }
 
     @Test
@@ -151,11 +153,31 @@ class OutboxPollingTest {
         assertEquals(1, events.map { it.messageId }.toSet().size, "둘 다 같은 message_id → 컨슈머가 이것으로 중복을 걸러낸다 (05)")
     }
 
+    /**
+     * 03과 04는 로컬에서 같은 Postgres(infra/docker-compose.yml의 lab DB, public 스키마)를 쓴다.
+     * 04의 테이블은 Debezium 커넥터(table.include.list = public.outbox) 때문에 이름이 `public.outbox`로 고정이다.
+     * 03이 같은 이름으로 다른 컬럼의 테이블을 먼저 만들어 두면, 04의 `CREATE TABLE IF NOT EXISTS outbox`는
+     * 아무 일도 안 하고 넘어가고 04의 insert가 "column aggregatetype does not exist"로 깨진다.
+     * → 03을 돌린 DB에 04 스키마를 적용하고 04 방식의 insert가 되는지 확인한다. (DDL도 롤백되는 Postgres 트랜잭션 안에서)
+     */
+    @Test
+    fun schema__does_not_collide_with_04_cdc_outbox_table() {
+        val cdcSchema = File("../04-outbox-cdc/src/main/resources/schema.sql").readText()
+        tx.executeWithoutResult { status ->
+            jdbc.execute(cdcSchema)
+            jdbc.update(
+                "INSERT INTO outbox (id, aggregatetype, aggregateid, type, payload) VALUES (?, 'payment', 'o', 'PaymentCompleted', '{}'::jsonb)",
+                UUID.randomUUID(),
+            )
+            status.setRollbackOnly() // 04의 테이블은 이 테스트 DB에 남기지 않는다
+        }
+    }
+
     private fun countOutbox(orderId: String) =
-        jdbc.queryForObject("SELECT count(*) FROM outbox WHERE aggregate_id = ?", Int::class.java, orderId)!!
+        jdbc.queryForObject("SELECT count(*) FROM outbox_polling WHERE aggregate_id = ?", Int::class.java, orderId)!!
 
     private fun outboxId(orderId: String) =
-        jdbc.queryForObject("SELECT id::text FROM outbox WHERE aggregate_id = ?", String::class.java, orderId)
+        jdbc.queryForObject("SELECT id::text FROM outbox_polling WHERE aggregate_id = ?", String::class.java, orderId)
 
     private fun newOrderId() = "order-" + UUID.randomUUID()
 }

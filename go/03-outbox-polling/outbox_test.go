@@ -101,6 +101,13 @@ func Test_broker_down__payment_saved__event_delivered_after_recovery(t *testing.
 	if len(recs) != 1 || string(recs[0].Key) != "order-1" {
 		t.Fatalf("복구 후 이벤트가 전달돼야 한다: %d건", len(recs))
 	}
+	// 헤더: message_id(= outbox.id) + event_type (Kotlin 03, 04 Debezium 과 같다)
+	if h := header(recs[0].Headers, "message_id"); h == "" {
+		t.Fatalf("message_id 헤더가 있어야 한다")
+	}
+	if h := header(recs[0].Headers, "event_type"); h != "PaymentCompleted" {
+		t.Fatalf("event_type 헤더 PaymentCompleted 기대: %q", h)
+	}
 	if n := count(t, `SELECT count(*) FROM outbox WHERE published_at IS NOT NULL`); n != 1 {
 		t.Fatalf("published_at 이 찍혀야 한다: %d", n)
 	}

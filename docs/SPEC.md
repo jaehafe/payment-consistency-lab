@@ -77,9 +77,9 @@ HTTP: `POST /payments`, 헤더 `Idempotency-Key`, 바디 `{"orderId": "...", "am
 
 ## 03-outbox-polling — Transactional Outbox + Polling Relay
 
-스키마 (+ payments):
+스키마 (+ payments). Kotlin 테이블 이름은 `outbox_polling` (04의 `public.outbox`와 같은 compose DB에서 충돌하지 않도록), Go는 스키마 `go_03` 로 격리:
 ```sql
-CREATE TABLE outbox (
+CREATE TABLE outbox_polling (   -- Go: go_03.outbox
   id              UUID PRIMARY KEY,         -- = message_id 헤더
   aggregate_type  TEXT NOT NULL,            -- 'payment'
   aggregate_id    TEXT NOT NULL,            -- orderId (= Kafka key)
@@ -88,18 +88,19 @@ CREATE TABLE outbox (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   published_at    TIMESTAMPTZ
 );
-CREATE INDEX outbox_unpublished_idx ON outbox (created_at) WHERE published_at IS NULL;
+CREATE INDEX outbox_polling_unpublished_idx ON outbox_polling (created_at) WHERE published_at IS NULL;
 ```
 - `PaymentService.pay`: **한 트랜잭션**에서 payments insert + outbox insert.
-- `OutboxRelay.relayOnce(batchSize)`: tx { `SELECT ... WHERE published_at IS NULL ORDER BY created_at LIMIT n FOR UPDATE SKIP LOCKED` → Kafka 동기 발행(acks=all) → `published_at=now()` } 커밋. 주기적으로 반복 실행.
+- `OutboxRelay.relayOnce(batchSize)`: tx { `SELECT ... WHERE published_at IS NULL ORDER BY created_at LIMIT n FOR UPDATE SKIP LOCKED` → Kafka 동기 발행(acks=all, 헤더 `message_id`·`event_type`) → `published_at=now()` } 커밋. 주기적으로 반복 실행.
 - **at-least-once**: 발행 후 커밋 전에 죽으면 재발행 → 중복 가능 (05에서 해결).
 
 테스트:
 - `pay__writes_payment_and_outbox_atomically`
 - `pay__db_failure__no_payment_no_outbox`
 - `broker_down__payment_saved__event_delivered_after_recovery`
-- `two_relays_concurrently__each_event_published_once` (SKIP LOCKED)
+- `two_relays_concurrently__each_event_published_once` (Kotlin 40건 / Go 30건, 모두 서로 다른 id로 정확히 1번·각 relay > 0. 중복을 막는 건 `FOR UPDATE`, `SKIP LOCKED`는 대기를 없앤다)
 - `crash_after_publish_before_mark__event_published_twice` (at-least-once 증명)
+- `schema__does_not_collide_with_04_cdc_outbox_table` (Kotlin만)
 
 ## 04-outbox-cdc — Debezium Outbox Event Router
 
@@ -142,10 +143,14 @@ CREATE TABLE processed_messages (
 ```
 - `NaiveConsumer`: 메시지 받을 때마다 orders 갱신 + point_ledger insert.
 - `IdempotentConsumer`: 같은 트랜잭션에서 `INSERT INTO processed_messages ... ON CONFLICT DO NOTHING` → 영향 행 0이면 skip. DB 커밋 **후** Kafka offset 커밋.
+- 처리 실패 시: 실패한 레코드 **앞까지만** offset 커밋하고 실패 레코드부터 다시 받는다 (Kotlin: `ConsumerRunner`가 실패한 배치를 커밋하지 않고 컨슈머를 재생성 → 배치 전체 재전달, 성공분은 processed_messages가 skip. Go: `rewindFrom`이 먼저 되감고 실패 앞까지 커밋 + `ConsumerLoop.Run`. fetch 에러 시에도 받은 레코드 전부 되감기). 실패 메시지를 건너뛰고 뒤 메시지 offset을 커밋하면 유실.
+- `message_id` 헤더가 없으면 명확한 에러(poison message, DLQ는 범위 밖).
 - 테스트:
   - `naive_consumer__duplicate_message__points_doubled`
   - `idempotent_consumer__duplicate_message__processed_once`
-  - `idempotent_consumer__crash_before_offset_commit__redelivery_is_skipped`
+  - `idempotent_consumer__crash_before_offset_commit__redelivery_is_skipped` (재전달 skip 후 offset = 메시지 offset + 1 단언)
+  - `consumer_loop__missing_message_id_header__fails_with_clear_error`
+  - `idempotent_consumer__handler_failure__offset_not_committed_past_failed_message` (Go만)
 
 ## 코드 스타일
 
@@ -178,17 +183,17 @@ CREATE TABLE withdrawals (
 ```
 `withdraw(accountId, amount) -> success/insufficient` 를 5가지 전략으로 구현 (성공 시 withdrawals에 1행):
 - `NaiveWithdraw`: READ COMMITTED에서 SELECT로 읽고 → 앱에서 검사 → `UPDATE SET balance = <읽은 값 - amount>`. 읽기와 쓰기 사이 지연 주입 가능(레이스를 결정적으로 재현).
-- `PessimisticWithdraw`: `SELECT ... FOR UPDATE`.
-- `OptimisticWithdraw`: `UPDATE ... SET balance=?, version=version+1 WHERE id=? AND version=?`, 0행이면 재시도(최대 N회).
+- `PessimisticWithdraw`: `SELECT ... FOR UPDATE`. (쓰기: Kotlin `balance = balance - ?`, Go `balance = <읽은 값 - amount>` — FOR UPDATE를 빼면 Kotlin은 초과 인출, Go는 lost update로 다르게 깨진다)
+- `OptimisticWithdraw`: `UPDATE ... SET balance=?, version=version+1 WHERE id=? AND version=?`, 0행이면 재시도 (최대 N회 = 첫 시도 포함 총 시도 횟수. Kotlin `maxAttempts`, Go `MaxAttempts`, 기본 20).
 - `SerializableWithdraw`: `SERIALIZABLE` 격리 수준, SQLSTATE `40001` 이면 재시도.
 - `ConditionalUpdateWithdraw`: `UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?` 한 문장 (실무에서 가장 흔한 답).
 - `transfer(from, to, amount)`: 두 계좌를 **id 순서로** 잠가 데드락 방지.
 
 테스트 (잔액 1,000 계좌에 1,000원 인출 10건 동시 요청 등):
-- `naive__concurrent_withdrawals__double_spending` (성공 >1 → 이중지불, 잔액과 withdrawals 합계 불일치)
+- `naive__concurrent_withdrawals__double_spending` (읽기-쓰기 지연으로 결정적: 10건 모두 성공, 출금 합계 10,000, 잔액 0)
 - `pessimistic__concurrent_withdrawals__exactly_one_succeeds`
-- `optimistic__concurrent_withdrawals__exactly_one_succeeds_with_retries`
-- `serializable__concurrent_withdrawals__exactly_one_succeeds_with_retries`
+- `optimistic__concurrent_withdrawals__exactly_one_succeeds_with_retries` (재시도 정확히 9회)
+- `serializable__concurrent_withdrawals__exactly_one_succeeds_with_retries` (40001 재시도 정확히 9회)
 - `conditional_update__concurrent_withdrawals__exactly_one_succeeds`
 - `transfer__opposite_directions_concurrently__no_deadlock` (A→B, B→A 동시 다수, 총액 보존)
 - `transfer__unordered_locking__deadlock_detected` (잠금 순서 미정렬 버전은 Postgres `40P01` 발생을 보여줌)
@@ -226,8 +231,12 @@ CREATE TABLE payment_status_history (
 - 전이는 `UPDATE ... SET status=? WHERE id=? AND status=?` (compare-and-set) + history insert 를 한 트랜잭션에서.
 - Fake PG: `charge(key, orderId, amount)`, `getStatus(key) -> APPROVED|FAILED|NOT_FOUND`, `cancel(pgTxId)`. 실패 주입: timeoutAfterCharge, timeoutBeforeCharge(요청이 PG에 도달 못함), failCancel.
 - PG 타임아웃 → `UNKNOWN` (실패로 단정하지 않는다! 승인됐을 수 있음).
-- `Janitor.reconcileUnknown(now)`: `UNKNOWN AND next_retry_at <= now` 를 `FOR UPDATE SKIP LOCKED`로 집어 PG 조회 → APPROVED/FAILED 확정. NOT_FOUND는 일정 시간 지나면 FAILED. 지수 백오프로 `next_retry_at` 갱신, `maxAttempts` 초과 시 `MANUAL_REVIEW`(보류, 사람 확인).
-- `CheckoutOrchestrator.checkout(order)`: 결제 승인 → 후속 단계(재고 확보 `InventoryClient.reserve`) 실패 시 **보상**: PG 취소 → `CANCELED`. 취소 실패 시 `CANCEL_REQUESTED`로 남기고 janitor가 재시도.
+- `Janitor.reconcileUnknown(now)`: `UNKNOWN AND next_retry_at <= now` 를 `FOR UPDATE SKIP LOCKED`로 집어 PG 조회 → APPROVED/FAILED 확정.
+  - `attempt_count` = janitor 확인 횟수. 행을 집을 때 같은 문장에서 +1 한다 (집은 뒤 크래시해도 횟수가 남는다 — Go는 PG 호출이 트랜잭션 안이라 롤백되는 한계).
+  - NOT_FOUND이고 `now < created_at + notFoundGrace`: "아직 판단 이르다" → 시도로 세지 않음(+1 취소), UNKNOWN 유지, `next_retry_at = created_at + notFoundGrace`.
+  - NOT_FOUND이고 grace 경과: FAILED. → PG에 도달 못한 결제는 MANUAL_REVIEW가 아니라 FAILED로 끝난다.
+  - 판단 불가(PG 조회 오류): 시도로 센다. `next_retry_at = now + base · 2^min(attempt-1, 20)`, `attempt_count >= maxAttempts`면 `MANUAL_REVIEW`(보류, 사람 확인).
+- `CheckoutOrchestrator.checkout(order)`: 결제 승인 → 후속 단계(재고 확보 `InventoryClient.reserve`) 실패 시 **보상**: PG 취소 → `CANCELED`. 취소 실패 시 `CANCEL_REQUESTED`로 남기고(`attempt_count = 1`, `next_retry_at = now + 지연`) janitor가 재시도. janitor는 CAS 충돌 행은 건너뛰고 배치를 계속한다.
 
 테스트:
 - `invalid_transition__rejected`
@@ -238,6 +247,9 @@ CREATE TABLE payment_status_history (
 - `unknown_exceeds_max_attempts__moved_to_manual_review`
 - `downstream_failure__compensated_by_pg_cancel`
 - `cancel_failure__left_cancel_requested__janitor_retries_cancel`
+- `not_found_within_grace__does_not_consume_attempts__ends_failed` (시계를 점프하지 않고 next_retry_at마다 janitor 실행)
+- `backoff__large_attempt__capped_without_overflow` (Go만)
+- `cancel_retry__stale_row_skipped__rest_of_batch_processed`, `janitor_crash_loop__claims_counted__moved_to_manual_review` (Kotlin만)
 
 README에 상태 다이어그램(mermaid)과 운영 쿼리(상태별 건수, 오래된 UNKNOWN, MANUAL_REVIEW 목록).
 
@@ -296,14 +308,19 @@ CREATE TABLE settlements (
   - PG 정산금 입금: Dr `bank:cash` / Cr `pg:receivable`
   - 가맹점 지급(출금): Dr `merchant:{id}:payable` / Cr `bank:cash` → settlement `PAID`
 - `LedgerService.post(entry)`: 차변 합 ≠ 대변 합이면 거부. ledger_lines insert + balance 갱신을 한 트랜잭션.
-- `SettlementService.settle(date)`: KST 거래일의 미정산 transactions 를 가맹점별 집계 → settlements 생성 + transactions.settlement_id 갱신. 같은 날짜 재실행해도 중복 없음.
+- `SettlementService.settle(date)`: KST 거래일의 미정산 transactions 를 `FOR UPDATE`로 잠그고 **잠근 id 목록**으로만 집계·`settlement_id` 갱신 (날짜 범위로 다시 찾으면 집계 후 커밋된 늦은 거래가 집계 없이 정산됨 표시된다). 같은 날짜 재실행해도 중복 없음.
+- 같은 결제를 두 번 기록해도 원장 전기 1회 + transactions 1행 (전기가 새로 생성됐을 때만 transactions insert).
+- 알 수 없는 계정 id는 거부.
 - `ReportQueries.dailyReport(date)`: 가맹점별 gross/refund/fee/net, 그리고 시산표(trial balance).
 
 테스트:
 - `payment_posting__debits_equal_credits`
 - `unbalanced_entry__rejected`
-- `fee_rounding__half_up_in_won`
-- `same_reference_posted_twice__single_entry`
+- `fee_rounding__half_up_in_won` (Double 함정 예: `5750 × 0.022 = 126.49999999999999` → `Math.round` 126, 정수식 127)
+- `same_reference_posted_twice__single_entry` (Kotlin은 transactions 1행·정산 gross 1배까지 단언)
+- `same_payment_recorded_twice__single_transaction_row` (Go)
+- `late_transaction_during_settle__not_marked_settled` (테스트 훅 `afterAggregate`로 결정적 재현)
+- `unknown_account__rejected`
 - `refund__reverses_payment_entries`
 - `settle__net_equals_gross_minus_refund_minus_fee`
 - `settle__uses_kst_day_boundary` (UTC 15:30 = 다음날 KST 00:30 → 다음날 정산)
@@ -326,7 +343,7 @@ CREATE TABLE internal_transactions (
 CREATE TABLE recon_files (             -- PG 정산 파일 import 이력 (같은 파일 두 번 import 방지)
   id         BIGSERIAL PRIMARY KEY,
   file_name  TEXT NOT NULL,
-  file_hash  TEXT NOT NULL UNIQUE,     -- SHA-256
+  file_hash  TEXT NOT NULL UNIQUE,     -- SHA-256 (정규화 내용: BOM 제거, CRLF·CR→LF, 줄 앞뒤 trim, 빈 줄 제거. 파싱도 같은 정규화 결과로)
   row_count  INT NOT NULL,
   imported_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -353,7 +370,7 @@ CREATE TABLE recon_results (
 );
 ```
 - PG 정산 파일 CSV 헤더: `pg_tx_id,order_id,type,amount,fee,transacted_at` (테스트 fixture로 제공).
-- 대사 SQL은 **별도 .sql 파일**(`recon_queries.sql`)에 이름 붙여 모아 둔다 — 사용자가 SQL만 따로 읽고 DB에서 직접 실행해볼 수 있게. 기법: `FULL OUTER JOIN ... ON pg_tx_id` (누락/금액차), `GROUP BY ... HAVING count(*) > 1` (중복). 대상 기간은 KST business_date.
+- 대사 SQL은 **별도 .sql 파일**(`recon_queries.sql`)에 이름 붙여 모아 둔다 — 사용자가 SQL만 따로 읽고 DB에서 직접 실행해볼 수 있게. 기법: `FULL OUTER JOIN ... ON pg_tx_id` (누락/금액차), `GROUP BY ... HAVING count(*) > 1` (중복). 대상 기간은 KST business_date를 **반열린 구간** `[KST 00:00, 다음날 KST 00:00)` 으로 (컬럼을 함수로 감싸지 않으므로 인덱스를 추가하면 쓸 수 있다 — 학습용 스키마엔 인덱스 없음).
 - `ReconciliationService.run(businessDate)`: 결과를 recon_results 에 저장, `ReconReport` (종류별 건수, 차액 합계, 일치 건수) 반환 + Markdown 리포트 문자열 생성.
 
 테스트:
@@ -364,12 +381,15 @@ CREATE TABLE recon_results (
 - `duplicate_in_pg_file__detected`
 - `duplicate_internal__detected`
 - `same_file_imported_twice__ignored`
+- `same_file_with_different_line_endings__ignored`
+- `kst_day_boundary__only_records_inside_day_counted`
+- `quoted_csv_field_with_comma__parsed`, `ReconReportLocaleTest.markdown_report__independent_of_jvm_locale` (Kotlin만)
 - `report__summarizes_counts_and_diff_amount`
 
 ## 10-observability — 로그 · 메트릭 · 장애 시나리오
 
 07의 결제 흐름을 간소화해 재사용 (PG 호출 + UNKNOWN 처리 + 멱등키 재요청) 하고 관측성을 붙인다.
-- **구조화 로그(JSON)**: 모든 로그에 `request_id`, `payment_id`, `order_id`, `idempotency_key`(있으면). `X-Request-Id` 헤더를 받아(없으면 생성) 요청 전체에 전파. Kotlin: Spring Boot 구조화 로깅(`logging.structured.format.console`) + MDC, Go: `log/slog` JSON 핸들러 + context.
+- **구조화 로그(JSON)**: 모든 로그에 `request_id`, `payment_id`, `order_id`, `idempotency_key`(있으면). `X-Request-Id` 헤더를 받아(없거나 `^[A-Za-z0-9._-]{1,64}$`에 안 맞으면 생성) 요청 전체에 전파. Kotlin: Spring Boot 구조화 로깅(`logging.structured.format.console`) + MDC, Go: `log/slog` JSON 핸들러 + context.
 - **메트릭(Prometheus)**:
   - `payment_requests_total{result="approved|failed|unknown|replayed|conflict"}`
   - `pg_call_duration_seconds` (histogram)
@@ -386,3 +406,5 @@ CREATE TABLE recon_results (
 - `duplicate_requests__replay_metric_increments`
 - `pg_latency__histogram_records_duration`
 - `metrics_endpoint_exposes_payment_metrics`
+- `RequestIdFilterTest.mdc_cleared_between_requests_on_same_thread` (Kotlin), `invalid_request_id_header__replaced` (Go)
+- Fake PG 타임아웃은 실제로 설정 시간만큼 대기 후 실패 (Kotlin `lab.pg.timeout-ms`, 기본 5000)

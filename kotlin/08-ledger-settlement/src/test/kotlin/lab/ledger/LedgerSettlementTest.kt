@@ -1,6 +1,8 @@
 package lab.ledger
 
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -10,6 +12,7 @@ import org.springframework.context.annotation.Import
 import org.springframework.jdbc.core.JdbcTemplate
 import java.time.Instant
 import java.time.LocalDate
+import java.util.concurrent.CompletableFuture
 
 @SpringBootTest
 @Import(TestcontainersConfiguration::class)
@@ -27,6 +30,11 @@ class LedgerSettlementTest {
     @BeforeEach
     fun clean() {
         jdbc.execute("TRUNCATE ledger_lines, journal_entries, ledger_accounts, transactions, settlements")
+    }
+
+    @AfterEach
+    fun resetHook() {
+        settlements.afterAggregateHook = null
     }
 
     @Test
@@ -64,6 +72,11 @@ class LedgerSettlementTest {
         assertEquals(1, Fees.calculate(49, 300), "1.47원 → 1원")
         assertEquals(300, Fees.calculate(10_000, 300))
 
+        // Double이 실제로 틀리는 예: 5,750원 × 2.2% = 126.5 → 127원이어야 하는데
+        assertEquals(126.49999999999999, 5_750 * 0.022, "0.022는 2진수로 정확히 표현되지 않는다")
+        assertEquals(126, Math.round(5_750 * 0.022), "Double + Math.round → 126원 (1원 손해)")
+        assertEquals(127, Fees.calculate(5_750, 220), "정수식 → 127원")
+
         // 원장에도 반올림된 정수 수수료가 들어간다
         txs.recordPayment("m1", "pg-1050", 1_050, dayTime)
         assertEquals(-32, ledger.balanceOf(Accounts.FEE_REVENUE))
@@ -78,6 +91,19 @@ class LedgerSettlementTest {
         assertEquals(1, count("journal_entries"))
         assertEquals(1, count("transactions"))
         assertEquals(10_000, ledger.balanceOf(Accounts.PG_RECEIVABLE), "20,000이 아니다")
+        assertEquals(10_000, settlements.settle(day).single().grossAmount, "정산 gross도 2배가 아니다")
+    }
+
+    @Test
+    fun unknown_account__rejected() {
+        val entry = JournalEntry(
+            "PG_DEPOSIT", "dep-typo", "오타 난 계정",
+            listOf(Line.debit("bank:cahs", 1_000), Line.credit(Accounts.PG_RECEIVABLE, 1_000)),
+        )
+
+        assertThrows<IllegalArgumentException> { ledger.post(entry) }
+        assertEquals(0, count("journal_entries"), "아무것도 기록되지 않았다")
+        assertEquals(0, count("ledger_accounts"), "오타 계정이 조용히 만들어지지 않는다")
     }
 
     @Test
@@ -142,6 +168,27 @@ class LedgerSettlementTest {
         assertEquals(1, count("settlements"))
         val settlementId = jdbc.queryForObject("SELECT settlement_id::text FROM transactions WHERE pg_tx_id = 'pg-1'", String::class.java)
         assertEquals(first.single().id.toString(), settlementId)
+    }
+
+    @Test
+    fun late_transaction_during_settle__not_marked_settled() {
+        txs.recordPayment("m1", "pg-1", 10_000, dayTime)
+        // 집계 직후, 다른 스레드(= 다른 트랜잭션)에서 같은 날 늦은 거래를 커밋한다
+        settlements.afterAggregateHook = {
+            CompletableFuture.runAsync { txs.recordPayment("m1", "pg-late", 5_000, dayTime.plusSeconds(3_600)) }.join()
+        }
+
+        val s = settlements.settle(day).single()
+
+        assertEquals(10_000, s.grossAmount, "집계는 늦은 거래 전")
+        val lateSettlementId = jdbc.queryForObject(
+            "SELECT settlement_id::text FROM transactions WHERE pg_tx_id = 'pg-late'", String::class.java,
+        )
+        assertNull(lateSettlementId, "집계에 없는 거래를 정산됨으로 표시하면 영영 정산되지 않는다")
+        val marked = jdbc.queryForObject(
+            "SELECT coalesce(sum(amount), 0) FROM transactions WHERE settlement_id = ?", Long::class.java, s.id,
+        )
+        assertEquals(s.grossAmount, marked, "정산됨 표시된 거래 합 = 정산 gross")
     }
 
     @Test

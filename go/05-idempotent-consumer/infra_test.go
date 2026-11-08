@@ -99,7 +99,7 @@ func newFixture(t *testing.T) fixture {
 	return f
 }
 
-// produce 는 같은 message_id 로 메시지를 times 번 보낸다.
+// produce 는 같은 message_id 로 메시지를 times 번 보낸다. messageID 가 "" 이면 헤더를 뺀다.
 // 03 단계에서 본 "릴레이가 발행 후 published_at 갱신 전에 죽어서 재발행" 상황을 그대로 재현한 것.
 func (f fixture) produce(t *testing.T, messageID string, times int) {
 	t.Helper()
@@ -115,7 +115,11 @@ func (f fixture) produce(t *testing.T, messageID string, times int) {
 	for i := 0; i < times; i++ {
 		rec := &kgo.Record{
 			Topic: f.topic, Key: []byte("order-1"), Value: payload,
-			Headers: []kgo.RecordHeader{{Key: "message_id", Value: []byte(messageID)}},
+		}
+		if messageID != "" { // "" 이면 헤더 없이 보낸다 (헤더 누락 테스트용)
+			rec.Headers = []kgo.RecordHeader{
+				{Key: "message_id", Value: []byte(messageID)},
+			}
 		}
 		if err := cl.ProduceSync(context.Background(), rec).FirstErr(); err != nil {
 			t.Fatal(err)

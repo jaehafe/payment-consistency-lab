@@ -43,13 +43,15 @@ func main() {
 		DB: db, Gateway: gw, Metrics: observability.NewMetrics(db, logger), Log: logger, PgTimeout: 5 * time.Second,
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/", observability.NewServer(svc, logger))
-	mux.Handle("POST /admin/faults", observability.FaultsHandler(gw)) // 장애 주입 (실습용)
+	mux := observability.Routes(svc)
+	// 장애 주입 (실습용). 같은 mux 에 붙여서 아래 미들웨어를 함께 탄다
+	// → 장애를 주입한 요청도 request_id 가 붙은 access log 로 남는다.
+	mux.Handle("POST /admin/faults", observability.FaultsHandler(gw))
+	handler := observability.RequestLogging(logger, mux)
 
 	addr := ":" + getenv("PORT", "8091")
 	logger.Info("listening", "addr", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		fatal(logger, err)
 	}
 }

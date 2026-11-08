@@ -3,6 +3,7 @@ package statemachine
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,10 +27,22 @@ type JanitorStats struct {
 	Approved, Failed, ManualReview, Rescheduled, Canceled int
 }
 
+// maxBackoffShift 는 지수의 상한 (Kotlin 의 coerceAtMost(20) 과 같다).
+// 1분 << 20 ≈ 2년. 이 이상은 의미도 없고 int64 오버플로만 난다.
+const maxBackoffShift = 20
+
 // backoff 는 n 번째 시도 후 기다릴 시간: Base, 2·Base, 4·Base, ...
-// time.Duration 은 int64(나노초)라서 << (비트 시프트)로 2의 거듭제곱을 곱할 수 있다.
+// time.Duration 은 int64(나노초)라서 << (비트 시프트)로
+// 2의 거듭제곱을 곱할 수 있다. 단, 상한이 없으면 1분 << 29 부터
+// int64 를 넘어 음수가 된다 → 지수를 maxBackoffShift 로 자른다.
 func (j *Janitor) backoff(attempt int) time.Duration {
-	return j.BaseBackoff << (attempt - 1)
+	// min 은 Go 1.21+ 내장 함수 (Kotlin 의 coerceAtMost)
+	shift := min(max(attempt-1, 0), maxBackoffShift)
+	// Base 가 아주 크면(약 2.4시간 이상) << 20 도 넘친다 → 최댓값에서 멈춤
+	if j.BaseBackoff > time.Duration(math.MaxInt64>>shift) {
+		return time.Duration(math.MaxInt64)
+	}
+	return j.BaseBackoff << shift
 }
 
 // unknownRow 는 janitor 가 집어 온 UNKNOWN 결제.
@@ -45,13 +58,18 @@ func (j *Janitor) ReconcileUnknown(ctx context.Context, now time.Time) (JanitorS
 	err := withTx(ctx, j.DB, func(tx pgx.Tx) error {
 		// FOR UPDATE SKIP LOCKED: janitor 를 여러 인스턴스 띄워도 같은 결제를 동시에 처리하지 않는다 (03 단계 릴레이와 같은 기법).
 		// 잠금은 이 트랜잭션 동안 유지된다. 그 사이 PG "조회"만 하므로(상태 변경 없음) 외부 호출을 tx 안에 둬도 괜찮다.
+		// 집으면서 attempt_count 를 1 올린다 (= 이번 확인도 1회로 센다).
+		// RETURNING 은 올린 뒤의 값을 돌려준다. Kotlin claimDue 와 같은 규칙.
 		rows, err := tx.Query(ctx, `
-			SELECT id::text, idempotency_key, attempt_count, created_at
-			  FROM payments
-			 WHERE status = 'UNKNOWN' AND next_retry_at <= $1
-			 ORDER BY next_retry_at
-			 LIMIT $2
-			   FOR UPDATE SKIP LOCKED`, now, j.batchSize())
+			UPDATE payments SET attempt_count = attempt_count + 1
+			 WHERE id IN (
+			   SELECT id FROM payments
+			    WHERE status = 'UNKNOWN' AND next_retry_at <= $1
+			    ORDER BY next_retry_at
+			    LIMIT $2
+			      FOR UPDATE SKIP LOCKED)
+			RETURNING id::text, idempotency_key, attempt_count,
+			          created_at`, now, j.batchSize())
 		if err != nil {
 			return err
 		}
@@ -79,17 +97,39 @@ func (j *Janitor) ReconcileUnknown(ctx context.Context, now time.Time) (JanitorS
 				}
 				stats.Failed++
 
-			case qerr == nil && status == PgNotFound && now.Sub(p.CreatedAt) >= j.NotFoundGrace:
-				// 충분히 기다렸는데도 PG 에 기록이 없다 → 요청이 PG 에 도달하지 못한 것. 돈은 안 빠졌다.
-				if err := j.fail(ctx, tx, p.ID, "janitor: pg has no record after grace period"); err != nil {
+			case qerr == nil && status == PgNotFound:
+				graceEnd := p.CreatedAt.Add(j.NotFoundGrace)
+				if !now.Before(graceEnd) { // now >= graceEnd
+					// 충분히 기다렸는데도 PG 에 기록이 없다
+					// → 요청이 PG 에 도달하지 못한 것. 돈은 안 빠졌다.
+					reason := "janitor: pg has no record after grace"
+					if err := j.fail(ctx, tx, p.ID, reason); err != nil {
+						return err
+					}
+					stats.Failed++
+					continue
+				}
+				// grace 안의 NOT_FOUND 는 "실패한 확인"이 아니라
+				// "아직 판단할 때가 아님"이다. 그래서 attempt_count 를
+				// 쓰지 않고, grace 가 끝나는 시각으로 바로 재예약한다.
+				// (시도 횟수를 쓰면 백오프 합 < grace 일 때 grace 가
+				//  끝나기도 전에 MANUAL_REVIEW 로 가 버린다)
+				// attempt_count - 1: 집을 때 올린 1 을 되돌린다.
+				if _, err := tx.Exec(ctx, `
+					UPDATE payments
+					   SET attempt_count = attempt_count - 1,
+					       last_error = $2, next_retry_at = $3
+					 WHERE id = $1`,
+					p.ID, "janitor: pg not found (within grace)",
+					graceEnd); err != nil {
 					return err
 				}
-				stats.Failed++
+				stats.Rescheduled++
 
 			default:
-				// 아직 결론을 못 냄 (조회 API 장애 또는 grace 기간 내 NOT_FOUND)
+				// 아직 결론을 못 냄 (조회 API 장애 등)
 				reason := fmt.Sprintf("janitor: inconclusive (status=%s, err=%v)", status, qerr)
-				attempts := p.Attempts + 1
+				attempts := p.Attempts // 집을 때 이번 시도까지 센 값
 				if attempts >= j.MaxAttempts {
 					// 자동 확인 포기 → 보류. 사람이 PG 어드민에서 확인해 처리한다 (README 의 운영 쿼리 참고).
 					if err := TransitionTx(ctx, tx, p.ID, Unknown, ManualReview, reason); err != nil {
@@ -134,13 +174,18 @@ type cancelRow struct {
 func (j *Janitor) RetryCancels(ctx context.Context, now time.Time) (JanitorStats, error) {
 	var stats JanitorStats
 	err := withTx(ctx, j.DB, func(tx pgx.Tx) error {
+		// UNKNOWN 과 같이, 집으면서 attempt_count 를 1 올린다.
 		rows, err := tx.Query(ctx, `
-			SELECT id::text, pg_tx_id, attempt_count
-			  FROM payments
-			 WHERE status = 'CANCEL_REQUESTED' AND next_retry_at <= $1
-			 ORDER BY next_retry_at
-			 LIMIT $2
-			   FOR UPDATE SKIP LOCKED`, now, j.batchSize())
+			UPDATE payments SET attempt_count = attempt_count + 1
+			 WHERE id IN (
+			   SELECT id FROM payments
+			    WHERE status = 'CANCEL_REQUESTED'
+			      AND next_retry_at <= $1
+			    ORDER BY next_retry_at
+			    LIMIT $2
+			      FOR UPDATE SKIP LOCKED)
+			RETURNING id::text, pg_tx_id, attempt_count`,
+			now, j.batchSize())
 		if err != nil {
 			return err
 		}
@@ -151,7 +196,7 @@ func (j *Janitor) RetryCancels(ctx context.Context, now time.Time) (JanitorStats
 		for _, p := range batch {
 			// PG 취소는 상태를 바꾸는 호출이지만 멱등하다(이미 취소된 건은 성공 처리). 그래서 재시도해도 안전하다.
 			if cerr := j.Gateway.Cancel(ctx, p.PgTxID); cerr != nil {
-				attempts := p.Attempts + 1
+				attempts := p.Attempts // 집을 때 이미 +1
 				// 취소는 "포기"할 수 없다 (돈을 돌려줘야 하므로). 백오프하며 계속 재시도하고, 오래된 건은 알림으로 사람을 부른다.
 				if _, err := tx.Exec(ctx,
 					`UPDATE payments SET attempt_count = $2, last_error = $3, next_retry_at = $4 WHERE id = $1`,

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -58,7 +60,11 @@ type IdempotentConsumer struct {
 func (c *IdempotentConsumer) Handle(ctx context.Context, rec *kgo.Record) (bool, error) {
 	msgID := header(rec, "message_id")
 	if msgID == "" {
-		return false, errors.New("message_id header is missing")
+		// %w 로 감싸면 errors.Is(err, ErrMissingMessageID) 로 판별 가능.
+		// 어느 메시지인지(토픽-파티션@offset) 같이 남긴다.
+		return false, fmt.Errorf("%w: %s-%d@%d (key=%s)",
+			ErrMissingMessageID,
+			rec.Topic, rec.Partition, rec.Offset, rec.Key)
 	}
 	ev, err := decode(rec)
 	if err != nil {
@@ -119,6 +125,9 @@ type ConsumerLoop struct {
 	CrashBeforeOffsetCommit bool // 실패 주입: DB 커밋 후 offset 커밋 전에 죽음
 }
 
+// ErrMissingMessageID 는 message_id 헤더가 없는 메시지. 중복 제거 키가 없으니 처리할 수 없다.
+var ErrMissingMessageID = errors.New("message_id header is missing")
+
 // ErrSimulatedCrash 는 offset 커밋 직전 크래시를 흉내 낸다.
 var ErrSimulatedCrash = errors.New("consumer crashed before offset commit (simulated)")
 
@@ -135,16 +144,21 @@ func (l *ConsumerLoop) PollOnce(ctx context.Context) (PollStats, error) {
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
+	recs := fetches.Records()
 	if errs := fetches.Errors(); len(errs) > 0 {
-		return stats, fmt.Errorf("fetch: %v", errs[0].Err)
+		// 에러가 난 fetch 에도 다른 파티션의 레코드가 섞여 올 수 있고,
+		// 클라이언트 위치는 이미 그 뒤로 넘어갔다. 처리 없이 버리면
+		// 다음 poll 이 그 뒤를 커밋해 유실된다 → 전부 되감는다.
+		cause := fmt.Errorf("fetch: %v", errs[0].Err)
+		return stats, l.rewindFrom(ctx, recs, 0, cause)
 	}
 
-	recs := fetches.Records()
-	for _, rec := range recs {
+	for i, rec := range recs {
 		processed, err := l.Handler.Handle(ctx, rec)
 		if err != nil {
-			// offset 을 커밋하지 않고 반환 → 재시작하면 이 메시지부터 다시 받는다.
-			return stats, err
+			// 실패한 메시지 "앞"까지만 커밋하고, 실패한 메시지부터
+			// 다시 받도록 되감는다. (아래 rewindFrom 설명 참고)
+			return stats, l.rewindFrom(ctx, recs, i, err)
 		}
 		if processed {
 			stats.Processed++
@@ -165,6 +179,69 @@ func (l *ConsumerLoop) PollOnce(ctx context.Context) (PollStats, error) {
 		}
 	}
 	return stats, nil
+}
+
+// rewindFrom 은 recs[failed] 처리 실패 후 정리한다.
+//
+// 그냥 return 만 하면 안 되는 이유: kgo.Client 는 메모리에 "다음에 가져올
+// 위치"를 들고 있고, 그 위치는 이미 실패한 메시지 뒤로 넘어가 있다.
+// 같은 클라이언트로 계속 poll 하면 그 뒤 메시지가 오고, 그걸 처리한 뒤
+// CommitRecords 가 실패한 메시지를 넘어선 offset 을 커밋한다 → 유실.
+// (Kotlin 의 ConsumerRunner 는 컨슈머를 새로 만들어서 피한다.)
+//
+//  1. 이번 fetch 에서 처리 못 한 파티션마다 첫 미처리 offset 으로 되감기
+//     → 다음 PollOnce 가 실패한 메시지부터 다시 받는다.
+//  2. 성공한 recs[:failed] 는 커밋 (진행분은 지킨다)
+//
+// 되감기를 먼저 하는 이유: 커밋이 실패해서 일찍 return 하더라도
+// 되감기는 이미 끝나 있어야 한다. 커밋 실패는 무해하다 — 성공분이
+// 다시 오면 processed_messages 가 skip 한다. 되감기 누락은 유실이다.
+func (l *ConsumerLoop) rewindFrom(
+	ctx context.Context, recs []*kgo.Record, failed int, cause error,
+) error {
+	// map[토픽]map[파티션]위치 — Kotlin의 Map<String, Map<Int, ...>>
+	seek := map[string]map[int32]kgo.EpochOffset{}
+	for _, r := range recs[failed:] {
+		if seek[r.Topic] == nil { // 없는 키를 읽으면 zero 값(nil)
+			seek[r.Topic] = map[int32]kgo.EpochOffset{}
+		}
+		// 파티션 안에서는 offset 이 오름차순 → 처음 본 것이 첫 미처리
+		if _, ok := seek[r.Topic][r.Partition]; !ok {
+			seek[r.Topic][r.Partition] = kgo.EpochOffset{
+				Epoch: r.LeaderEpoch, Offset: r.Offset,
+			}
+		}
+	}
+	// Kotlin(Java) 의 consumer.seek(partition, offset) 에 해당.
+	l.Client.SetOffsets(seek)
+
+	if failed > 0 {
+		done := recs[:failed] // 슬라이스 앞부분 [0, failed)
+		if err := l.Client.CommitRecords(ctx, done...); err != nil {
+			return errors.Join(cause, err) // 에러 둘을 묶는다
+		}
+	}
+	return cause
+}
+
+// Run 은 ctx 가 취소될 때까지 PollOnce 를 반복한다. (Kotlin ConsumerRunner)
+//
+// 실패하면 PollOnce 가 실패한 메시지부터 다시 받도록 되감아 두므로
+// 같은 클라이언트로 그대로 계속 돌면 된다. 같은 메시지가 계속 실패하면
+// (poison message) 여기서 무한히 재시도한다 → README "한계" 참고.
+func (l *ConsumerLoop) Run(ctx context.Context, retryDelay time.Duration) {
+	for ctx.Err() == nil { // ctx 가 취소되면 Err() 가 nil 이 아니게 된다
+		_, err := l.PollOnce(ctx)
+		if err == nil || ctx.Err() != nil {
+			continue
+		}
+		log.Printf("처리 실패, %v 뒤 같은 메시지부터 재시도: %v",
+			retryDelay, err)
+		select {
+		case <-ctx.Done():
+		case <-time.After(retryDelay):
+		}
+	}
 }
 
 // ---- 헬퍼 ----

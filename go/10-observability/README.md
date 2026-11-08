@@ -19,6 +19,7 @@
 ```
 
 - 미들웨어가 `X-Request-Id` 헤더를 받거나(없으면 생성) 응답 헤더로 돌려주고, `context.Context` 에 로그 필드 묶음을 넣는다.
+  헤더 값은 `^[A-Za-z0-9._-]{1,64}$` 일 때만 쓰고, 아니면 새로 만든다 (값이 그대로 로그 필드가 되므로 인젝션/거대 값 방지, Kotlin `RequestIdFilter` 와 같은 규칙).
 - 서비스가 결제 행을 만들면 같은 묶음에 `payment_id` 를 추가 → 이후 모든 로그(미들웨어의 access log 포함)에 붙는다.
 - Spring 의 MDC 와 같은 역할. Go 에는 스레드 로컬이 없어서 ctx 로 전달하고, `slog.Handler` 데코레이터가 ctx 에서 꺼내 붙인다.
 
@@ -36,7 +37,8 @@
 ## 핵심 코드 위치
 
 - `logging.go:36` `AddLogAttrs` — `context.WithValue` 로 요청 단위 로그 필드 묶음, `logging.go:73` `contextHandler`(slog 데코레이터)
-- `server.go:31` `RequestLogging` 미들웨어 — `:33` X-Request-Id, `:43` `r.WithContext(ctx)` 로 전파, access log
+- `server.go:47` `RequestLogging` 미들웨어 — `:51` X-Request-Id 검증(`:41` 정규식), `:60` `r.WithContext(ctx)` 로 전파, access log
+- `server.go:25` `Routes` — 미들웨어 없는 mux. `cmd/main.go` 가 여기에 `/admin/faults` 를 붙인 뒤 전체를 미들웨어로 한 번 감싼다 → 장애 주입 요청도 request_id 가 붙은 access log 로 남는다
 - `metrics.go:44` `NewMetrics` — `:45` 전용 레지스트리, `:56` 버킷, `:67` DB 기반 GaugeFunc, `:84` 라벨 0 초기화
 - `service.go:49` `pay` — `:67` PG 타임아웃, `:72` 히스토그램 기록, `:82` 타임아웃 → UNKNOWN, `service.go:102` replay/conflict
 - `gateway.go:71` `FaultsHandler` — 실행 중 장애 주입 (`/admin/faults`)
@@ -52,6 +54,7 @@ go test ./10-observability/ -v
 | 테스트 | 증명하는 것 |
 |---|---|
 | `Test_request_id_propagated_to_all_logs` | 로그를 버퍼로 캡처 → 4줄 모두 같은 request_id + order_id + idempotency_key (+ payment_id). 헤더 없으면 생성된 id 가 응답 헤더와 모든 로그에 |
+| `Test_invalid_request_id_header__replaced` | 따옴표가 든 값 / 65자 / 공백이 든 X-Request-Id → 버리고 새 id 생성, 그 값은 응답 헤더에도 로그에도 없음 |
 | `Test_pg_timeout__unknown_counter_and_gauge_increase` | PG 무응답 3건 → 202, `result="unknown"` 3, 게이지 3. DB 에서 1건 확정하면 게이지 2 |
 | `Test_duplicate_requests__replay_metric_increments` | 같은 key 3번 → replays 2, approved 1, PG 호출 1, 응답 동일 |
 | `Test_pg_latency__histogram_records_duration` | PG 150ms → 샘플 1, 합 ≥ 0.15s, le=0.1 버킷 0 / le=0.25 버킷 1 |
@@ -103,7 +106,7 @@ Prometheus `http://localhost:9090/alerts` 에서 알림 상태, Grafana 에서 �
 
 재현: `curl -X POST 'localhost:8091/admin/faults?hang=true'` (복구: `hang=false`)
 
-1. **알림**: `PaymentFailureRateHigh` (failed+unknown 비율 > 5%), `PaymentUnknownPiling` (`payment_unknown_current > 10`, 2분).
+1. **알림** (뜨는 순서): 먼저 `PaymentUnknownPiling` (`payment_unknown_current > 10`, `for: 2m`). 위 트래픽 루프는 요청을 하나씩 보내므로 타임아웃(5s) 동안 5초에 1건으로 느려져 10건을 넘기까지 약 1분, 거기에 2분 → 약 3분 뒤. 그다음 약 5분 뒤 `PaymentFailureRateHigh` (failed+unknown 비율 > 5%, `for: 5m`)와 `PgLatencyHigh` (p99 ≈ 타임아웃 5s > 3s, `for: 5m`)가 거의 함께 뜬다.
 2. **메트릭**:
    ```promql
    sum(rate(payment_requests_total{result="unknown"}[5m])) / sum(rate(payment_requests_total[5m]))   # UNKNOWN 비율

@@ -137,6 +137,14 @@ func (s *PaymentService) lockKey(ctx context.Context, key, path, hash string) (k
 
 	// 동시에 같은 key 로 두 요청이 와도 UNIQUE 제약 때문에 한 행만 생긴다.
 	// 늦게 온 쪽의 INSERT 는 먼저 온 tx 가 커밋될 때까지 기다렸다가 DO NOTHING 이 된다.
+	//
+	// Kotlin 과의 차이: Kotlin 은 INSERT 에서 locked_at=now() 를 넣고
+	// "새로 만들었으면 바로 반환" 한다. 여기서는 locked_at 을 비워 넣고
+	// 아래의 공통 경로(FOR UPDATE → 판정 → UPDATE locked_at)를 그대로 탄다.
+	// 버그가 아니다: INSERT·판정·잠금이 "한 tx" 에서 커밋되므로
+	// 다른 요청이 locked_at=NULL 인 새 행을 보는 순간은 없다.
+	// (늦게 온 요청은 INSERT 에서 기다렸다가, 커밋된 "잠긴" 행을 읽고 409)
+	// 새 key 는 hash 가 당연히 같고 잠금도 없으니 판정을 그냥 통과한다.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO idempotency_keys (idempotency_key, request_path, request_hash, recovery_point)
 		VALUES ($1, $2, $3, $4)

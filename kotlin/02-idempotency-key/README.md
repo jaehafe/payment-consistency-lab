@@ -57,9 +57,12 @@ cd kotlin
 |---|---|
 | `same_key_twice__charged_once__same_response` | 두 번째 요청은 PG를 호출조차 안 하고 같은 응답 |
 | `same_key_different_body__422` | key 재사용 + 다른 금액 → 422 |
-| `concurrent_same_key__only_one_charge` | 스레드 10개가 동시에 같은 key → 201 + 409들, PG 호출 1번, payments 1건 |
-| `pg_timeout_after_charge__retry_resumes__no_double_charge` | 승인 후 응답 유실 → 503 → 재시도 시 PG 호출은 2번이지만 실제 승인은 1번 |
+| `concurrent_same_key__only_one_charge` | 스레드 10개가 동시에 같은 key → PG **호출** 1번(우리 Phase 1 잠금이 막음) · 승인 1번, payments 1건. 응답은 201(≥1, 모두 같은 바디) 또는 409(≥1)뿐, 5xx 없음 |
+| `pg_timeout_after_charge__retry_resumes__no_double_charge` | 승인 후 응답 유실 → 503, key는 `started` + 잠금 해제 → 재시도 시 PG 호출은 2번이지만 실제 승인은 1번(PG 멱등성이 막음) |
 | `missing_header__400` | 헤더 없으면 400, PG 호출 0번 |
+
+201/409의 **개수**는 보장 대상이 아니다. 처리 중에 온 요청은 409, 처리가 끝난 뒤 도착한 요청은 저장된 201을 재생받으므로 타이밍에 따라 201이 여러 개일 수 있다 (보통은 201×1, 409×9). 보장되는 것은 **PG 승인 1회**다.
+`callCount()`와 `chargeCount()`를 같이 보면 "누가 막았나"가 구분된다: call=1·charge=1은 **우리 서버**가, call=2·charge=1은 **PG 멱등성**이 막은 것.
 
 ## 한계 / 다음 단계
 

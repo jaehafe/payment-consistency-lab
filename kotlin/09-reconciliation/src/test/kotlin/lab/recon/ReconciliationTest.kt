@@ -109,6 +109,64 @@ class ReconciliationTest {
     }
 
     @Test
+    fun same_file_with_different_line_endings__ignored() {
+        val lf = fixture("pg_settlement_2026-11-07.csv")
+        // 같은 내용인데 Windows에서 다시 저장돼 CRLF + 끝 개행이 하나 더 붙은 재전송
+        val crlf = (String(lf).replace("\n", "\r\n") + "\r\n").toByteArray()
+
+        val first = importer.import("pg_settlement_2026-11-07.csv", lf)
+        val second = importer.import("pg_settlement_2026-11-07.crlf.csv", crlf)
+
+        assertTrue(first.imported)
+        assertEquals(false, second.imported, "줄바꿈만 다른 같은 파일 → 무시")
+        assertEquals(8, count("pg_settlement_records"))
+    }
+
+    @Test
+    fun quoted_csv_field_with_comma__parsed() {
+        // RFC 4180: 콤마가 든 필드는 따옴표로 감싸고, 따옴표 자체는 "" 로 쓴다
+        val csv = listOf(
+            "pg_tx_id,order_id,type,amount,fee,transacted_at",
+            "tx-q-1,\"order-9,gift\",PAYMENT,10000,300,2026-11-07T01:00:00Z",
+            "tx-q-2,\"order-\"\"10\"\"\",PAYMENT,20000,600,2026-11-07T02:00:00Z",
+        ).joinToString("\n")
+
+        val result = importer.import("quoted.csv", csv.toByteArray())
+
+        assertEquals(2, result.rowCount)
+        val orders = jdbc.queryForList(
+            "SELECT order_id FROM pg_settlement_records ORDER BY pg_tx_id", String::class.java,
+        )
+        assertEquals(listOf("order-9,gift", "order-\"10\""), orders)
+    }
+
+    @Test
+    fun kst_day_boundary__only_records_inside_day_counted() {
+        // 11-07 KST = [2026-11-06T15:00Z, 2026-11-07T15:00Z). 같은 거래인데 한쪽만 경계를 넘는다.
+        // tx-start: 내부는 정확히 시작 시각(포함), PG는 1초 전(전날) → MISSING_IN_PG
+        // tx-end:   내부는 정확히 끝 시각(제외), PG는 1초 전(포함)   → MISSING_IN_INTERNAL
+        internal("tx-start", "order-s", "PAYMENT", 1_000, "2026-11-06T15:00:00Z")
+        internal("tx-end", "order-e", "PAYMENT", 2_000, "2026-11-07T15:00:00Z")
+        val csv = """
+            pg_tx_id,order_id,type,amount,fee,transacted_at
+            tx-start,order-s,PAYMENT,1000,30,2026-11-06T14:59:59Z
+            tx-end,order-e,PAYMENT,2000,60,2026-11-07T14:59:59Z
+        """.trimIndent()
+        importer.import("boundary.csv", csv.toByteArray())
+
+        val report = recon.run(businessDate)
+
+        assertEquals(0, report.matchedCount)
+        assertEquals(
+            listOf(
+                Discrepancy(DiscrepancyKind.MISSING_IN_INTERNAL, "tx-end", null, 2_000, 2_000),
+                Discrepancy(DiscrepancyKind.MISSING_IN_PG, "tx-start", 1_000, null, -1_000),
+            ),
+            report.discrepancies,
+        )
+    }
+
+    @Test
     fun report__summarizes_counts_and_diff_amount() {
         val report = runMixed()
 

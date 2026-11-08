@@ -8,7 +8,12 @@ import org.springframework.web.bind.annotation.RestController
 
 data class PaymentRequest(val orderId: String, val amount: Long)
 
-data class PgFaults(val latencyMs: Long? = null, val timeoutAfterCharge: Boolean? = null, val declineCharge: Boolean? = null)
+data class PgFaults(
+    val latencyMs: Long? = null,
+    val timeoutAfterCharge: Boolean? = null,
+    val declineCharge: Boolean? = null,
+    val timeoutMs: Long? = null,
+)
 
 @RestController
 class PaymentController(
@@ -31,6 +36,10 @@ class PaymentController(
         f.latencyMs?.let { pg.latencyMs = it }
         f.timeoutAfterCharge?.let { pg.timeoutAfterCharge = it }
         f.declineCharge?.let { pg.declineCharge = it }
-        return mapOf("latencyMs" to pg.latencyMs, "timeoutAfterCharge" to pg.timeoutAfterCharge, "declineCharge" to pg.declineCharge)
+        f.timeoutMs?.let { pg.timeoutMs = it }
+        return mapOf(
+            "latencyMs" to pg.latencyMs, "timeoutAfterCharge" to pg.timeoutAfterCharge,
+            "declineCharge" to pg.declineCharge, "timeoutMs" to pg.timeoutMs,
+        )
     }
 }

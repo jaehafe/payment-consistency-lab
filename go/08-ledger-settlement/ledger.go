@@ -53,6 +53,10 @@ type JournalEntry struct {
 
 var ErrUnbalancedEntry = errors.New("unbalanced journal entry: debits != credits")
 
+// ErrUnknownAccount: 계정과목에 없는 계정 ID.
+// (Kotlin 의 IllegalArgumentException("알 수 없는 계정"))
+var ErrUnknownAccount = errors.New("unknown account")
+
 // Validate 는 분개 규칙을 검사한다. 가장 중요한 규칙: 차변 합계 == 대변 합계.
 // 이 규칙 덕분에 원장 전체에서 "잔액 합 = 0" 이 항상 유지된다 (돈이 생기거나 사라지지 않는다).
 func (e JournalEntry) Validate() error {
@@ -139,19 +143,31 @@ func PostTx(ctx context.Context, tx pgx.Tx, e JournalEntry) (bool, error) {
 
 // ensureAccount 는 가맹점 계정을 처음 쓸 때 만든다.
 func ensureAccount(ctx context.Context, tx pgx.Tx, id string) error {
-	_, err := tx.Exec(ctx,
-		`INSERT INTO ledger_accounts (id, type) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, id, accountTypeOf(id))
+	typ, err := accountTypeOf(id)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO ledger_accounts (id, type) VALUES ($1, $2)
+		ON CONFLICT (id) DO NOTHING`, id, typ)
 	return err
 }
 
-func accountTypeOf(id string) string {
+// accountTypeOf 는 계정 ID 로 유형을 정한다. 모르는 ID 는 에러.
+// "나머지는 다 ASSET" 으로 두면 오타 난 계정("bank:cahs")이 조용히 생기고,
+// 시산표 합은 여전히 0 이라 아무도 모른다.
+func accountTypeOf(id string) (string, error) {
 	switch {
-	case strings.HasPrefix(id, "merchant:"):
-		return "LIABILITY"
+	case id == AccountPgReceivable, id == AccountBankCash:
+		return "ASSET", nil
 	case id == AccountFeeRevenue:
-		return "REVENUE"
+		return "REVENUE", nil
+	case strings.HasPrefix(id, "merchant:") &&
+		strings.HasSuffix(id, ":payable"):
+		return "LIABILITY", nil
 	default:
-		return "ASSET"
+		// %w 로 감싸면 호출자가 errors.Is(err, ErrUnknownAccount) 로 판별 가능
+		return "", fmt.Errorf("%w: %s", ErrUnknownAccount, id)
 	}
 }
 

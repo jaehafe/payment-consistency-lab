@@ -129,6 +129,31 @@ func Test_request_id_propagated_to_all_logs(t *testing.T) {
 	}
 }
 
+// 헤더 값을 그대로 로그 필드에 넣으므로, 이상한 값은 버리고 새로 만든다
+// (Kotlin RequestIdFilter 의 정규식과 같은 규칙)
+func Test_invalid_request_id_header__replaced(t *testing.T) {
+	a := newApp(t)
+	for _, bad := range []string{
+		`x","payment_id":"forged`, // JSON/로그 인젝션 시도
+		strings.Repeat("a", 65),   // 너무 김
+		"has space",
+	} {
+		rec := a.do(t, http.MethodPost, "/payments",
+			map[string]string{"Idempotency-Key": "k-" + bad,
+				"X-Request-Id": bad},
+			`{"orderId":"order-1","amount":10000}`)
+		got := rec.Header().Get("X-Request-Id")
+		if got == bad || got == "" {
+			t.Fatalf("잘못된 X-Request-Id 는 새로 생성: %q", got)
+		}
+		for _, l := range a.logs.lines(t) {
+			if l["request_id"] == bad {
+				t.Fatalf("잘못된 값이 로그에 들어갔다: %v", l)
+			}
+		}
+	}
+}
+
 func Test_pg_timeout__unknown_counter_and_gauge_increase(t *testing.T) {
 	a := newApp(t)
 	a.gateway.Hang.Store(true) // PG 가 응답하지 않음 → 300ms 타임아웃

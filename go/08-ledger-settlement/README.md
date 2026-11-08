@@ -3,9 +3,10 @@
 ## 문제
 
 - `merchants.balance += 9700` 처럼 잔액 컬럼 하나만 고치면, 나중에 "이 돈이 어디서 와서 어디로 갔는지" 설명할 수 없다. 버그로 숫자가 틀어지면 찾을 방법도 없다.
-- 수수료를 `amount * 0.03` (float)으로 계산하면 `1050 * 0.03 = 31.499999...` → 반올림이 틀린다.
+- 수수료를 float 로 계산하면 반올림이 틀린다: 5,750원 × 2.2% = 126.5 → 127원이어야 하는데 float64 `5750 * 0.022 = 126.49999999999999` → `math.Round` = 126원. (`1050 * 0.03` 은 우연히 정확히 31.5 라 예시로 부적절)
 - 정산 배치가 두 번 돌면 가맹점에 두 번 지급한다.
-- 같은 결제 이벤트가 두 번 오면(05 의 at-least-once) 원장에 두 번 쌓인다.
+- 같은 결제 이벤트가 두 번 오면(05 의 at-least-once) 원장에 두 번 쌓인다. 원장만 막고 원천 거래(`transactions`)를 또 넣으면 정산 gross 가 2배가 된다.
+- 정산이 집계한 뒤 "정산됨" 표시를 날짜 범위로 다시 찾아 찍으면, 그 사이 커밋된 늦은 거래가 금액엔 없는데 정산됨으로 표시된다 (영영 정산 안 됨). 수정 후에는 늦은 거래가 `settlement_id` 없이 남아 **드러난다** — 같은 날 정산이 이미 있어 자동으로 정산되지는 않는다 (한계 참고).
 - "11월 8일 거래"를 UTC 로 자르면 KST 00:00~08:59 거래가 전날로 간다.
 
 ## 해결
@@ -23,17 +24,20 @@
 10,000원 결제 → 입금 → 지급까지 끝나면: `pg:receivable 0`, `merchant payable 0`, `bank:cash +300`, `fee_revenue -300`. 은행에 남은 300원이 정확히 우리 수수료.
 
 - **수수료**: `fee = (amount × rateBps + 5000) / 10000` — 정수만으로 원 단위 HALF_UP.
-- **원장 멱등성**: `journal_entries UNIQUE(reference_type, reference_id)` + `ON CONFLICT DO NOTHING`.
+- **원장 멱등성**: `journal_entries UNIQUE(reference_type, reference_id)` + `ON CONFLICT DO NOTHING`. 원천 거래는 분개가 **새로 전기됐을 때만** insert (`record`).
 - **정산 멱등성**: 정산된 거래에 `settlement_id` 를 찍고, `settlements UNIQUE(merchant_id, settlement_date)`.
+- **정산 경쟁 조건**: `FOR UPDATE` 로 잠근 거래 ID 목록을 받아 두고, 집계와 `settlement_id` 기록을 `id = ANY(ids)` 로만 한다 (날짜 범위로 다시 찾지 않음).
+- **모르는 계정 거부**: 정해진 계정과목에 없는 ID 는 `ErrUnknownAccount` (오타 계정이 조용히 ASSET 으로 생기지 않게).
 - **KST 경계**: `time.LoadLocation("Asia/Seoul")` 로 KST 자정 ~ 다음 자정 범위를 만들어 `occurred_at >= start AND < end`.
 
 ## 핵심 코드 위치
 
-- `ledger.go:58` `Validate` — 차변 합 ≠ 대변 합이면 거부
-- `ledger.go:96` `PostTx` — `:106` 참조 중복 방지, `:118` 계정 ID 순 정렬(데드락 방지, 06 참고), `:132` debit-positive 잔액 갱신
-- `transactions.go:21` `CalculateFee` (HALF_UP), `:91` `PaymentEntry`, `:103` `RefundEntry`(역분개)
-- `settlement.go:31` `KSTDayRange`, `settlement.go:57` `Settle` — `:71` 대상 거래 잠금, `:78-81` `FILTER` 집계, `:105` 정산 중복 방지
-- `settlement.go:128` `RecordPgDeposit`, `:143` `Payout` (분개 + PAID 를 한 트랜잭션)
+- `ledger.go:62` `Validate` — 차변 합 ≠ 대변 합이면 거부
+- `ledger.go:100` `PostTx` — `:110` 참조 중복 방지, `:122` 계정 ID 순 정렬(데드락 방지, 06 참고), `:136` debit-positive 잔액 갱신
+- `ledger.go:159` `accountTypeOf` — 모르는 계정 ID 는 `ErrUnknownAccount`
+- `transactions.go:24` `CalculateFee` (HALF_UP), `:81` `record` (`:91` 이미 전기됐으면 거래 insert 안 함), `:104` `PaymentEntry`, `:116` `RefundEntry`(역분개)
+- `settlement.go:31` `KSTDayRange`, `settlement.go:62` `Settle` — `:78` 대상 거래 잠금 + ID 수집, `:97-102` 잠근 ID 만 `FILTER` 집계, `:132` 정산 중복 방지, `:140` 잠근 ID 에만 settlement_id
+- `settlement.go:152` `RecordPgDeposit`, `:167` `Payout` (분개 + PAID 를 한 트랜잭션)
 - `report.go:44` `DailyReport` — 가맹점별 gross/refund/fee/net + 시산표
 
 ## 테스트 실행
@@ -47,14 +51,17 @@ go test ./08-ledger-settlement/ -v
 |---|---|
 | `Test_payment_posting__debits_equal_credits` | 차변 10,000 = 대변 10,000, 계정 잔액 +10,000 / -9,700 / -300 |
 | `Test_unbalanced_entry__rejected` | 1,000원이 빈 분개 → 거부, 아무것도 기록 안 됨 |
-| `Test_fee_rounding__half_up_in_won` | 1,050→32, 1,049→31, 1,017→31, 1,016→30, 50→2 … (테이블 테스트) |
+| `Test_fee_rounding__half_up_in_won` | 1,050→32, 1,049→31, 1,017→31, 1,016→30, 50→2 … (테이블 테스트). float64 `5750*0.022` → `math.Round` 126 vs 정수식(220bps) 127 |
 | `Test_same_reference_posted_twice__single_entry` | 같은 PG 거래 두 번 → 분개 1건, 잔액 1회 반영 |
 | `Test_refund__reverses_payment_entries` | 전액 환불 → 모든 계정 0, 3줄 모두 차/대변 반전 |
 | `Test_settle__net_equals_gross_minus_refund_minus_fee` | net 12,658 = 15,050 - 2,000 - 392, 원장의 가맹점 부채와 일치 |
 | `Test_settle__uses_kst_day_boundary` | UTC 11/7 15:30(=KST 11/8 00:30) 은 11/8 정산, UTC 14:59 는 11/7 정산 |
 | `Test_settle_twice_same_date__no_duplicate_settlement` | 재실행 시 새 정산 0건 |
 | `Test_payout__merchant_payable_zero_after_payout` | 지급 후 가맹점 부채 0, 현금 300 = 수수료 수익, 이중 지급 거부 |
-| `Test_trial_balance__sum_of_balances_is_zero` | 결제·환불·정산·입금·지급 후 잔액 합 0, 차변 합 = 대변 합 (`-v` 로 시산표 출력) |
+| `Test_trial_balance__sum_of_balances_is_zero` | 결제·환불·정산·입금·지급 후 잔액 합 0, 차변 합 = 대변 합, 계정별 캐시 잔액 = 라인 합(차변-대변) (`-v` 로 시산표 출력) |
+| `Test_same_payment_recorded_twice__single_transaction_row` | 같은 결제 `RecordPayment` 2회 → transactions 1행, 정산 gross 10,000 (2배 아님) |
+| `Test_late_transaction_during_settle__not_marked_settled` | 집계 직후(테스트 훅) 커밋된 늦은 거래 → 정산 gross 10,000, 늦은 거래 settlement_id 없음, 정산됨 표시 합 = gross |
+| `Test_unknown_account__rejected` | 오타 계정(`bank:cahs`) → `ErrUnknownAccount`, 분개·계정 아무것도 안 생김 |
 
 ## 한계 / 다음 단계
 

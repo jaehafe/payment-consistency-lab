@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -50,6 +51,17 @@ var (
 type CheckoutOrchestrator struct {
 	Payments  *PaymentService
 	Inventory InventoryClient
+
+	// CancelRetryDelay: 보상 취소를 janitor 가 처음 재시도하기까지의
+	// 지연 (Kotlin 은 lab.janitor.base-backoff). 0 이면 10초.
+	CancelRetryDelay time.Duration
+}
+
+func (o *CheckoutOrchestrator) cancelRetryDelay() time.Duration {
+	if o.CancelRetryDelay <= 0 {
+		return 10 * time.Second
+	}
+	return o.CancelRetryDelay
 }
 
 func (o *CheckoutOrchestrator) Checkout(ctx context.Context, order Order) (Payment, error) {
@@ -71,13 +83,19 @@ func (o *CheckoutOrchestrator) Checkout(ctx context.Context, order Order) (Payme
 	repo := o.Payments.Repo
 	// 1) PG 취소를 "부르기 전에" CANCEL_REQUESTED 로 기록한다.
 	//    취소 호출 중 프로세스가 죽어도, 이 기록이 남아 있으면 janitor 가 이어서 취소한다. (기록 먼저, 외부 호출 나중)
+	//    next_retry_at 은 "지금 + 지연": 지금 이 요청이 취소를 부르는
+	//    중인데 janitor 가 바로 같은 건을 집어 가 경쟁하지 않도록.
 	err = withTx(ctx, repo.DB, func(tx pgx.Tx) error {
 		if err := TransitionTx(ctx, tx, p.ID, Approved, CancelRequested, "compensate: "+reserveErr.Error()); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx,
-			`UPDATE payments SET attempt_count = 0, next_retry_at = now(), last_error = $2 WHERE id = $1`,
-			p.ID, reserveErr.Error())
+		_, err := tx.Exec(ctx, `
+			UPDATE payments
+			   SET attempt_count = 0, next_retry_at = $3,
+			       last_error = $2
+			 WHERE id = $1`,
+			p.ID, reserveErr.Error(),
+			time.Now().Add(o.cancelRetryDelay()))
 		return err
 	})
 	if err != nil {
@@ -86,7 +104,16 @@ func (o *CheckoutOrchestrator) Checkout(ctx context.Context, order Order) (Payme
 
 	// 2) PG 취소
 	if cancelErr := o.Payments.Gateway.Cancel(ctx, p.PgTxID); cancelErr != nil {
-		_, _ = repo.DB.Exec(ctx, `UPDATE payments SET last_error = $2 WHERE id = $1`, p.ID, cancelErr.Error())
+		// 취소 1회 실패 = 시도 1회. janitor 는 지연 뒤부터 백오프로 이어 간다.
+		// status 조건(CAS)을 걸어 그 사이 상태가 바뀌었으면 건드리지 않는다.
+		_, _ = repo.DB.Exec(ctx, `
+			UPDATE payments
+			   SET attempt_count = 1, next_retry_at = $3,
+			       last_error = $2
+			 WHERE id = $1 AND status = $4`,
+			p.ID, cancelErr.Error(),
+			time.Now().Add(o.cancelRetryDelay()),
+			string(CancelRequested))
 		p, _ = repo.Get(ctx, p.ID)
 		return p, fmt.Errorf("%w: %v", ErrCompensationPending, cancelErr)
 	}

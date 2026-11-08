@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -92,6 +93,17 @@ func Test_fee_rounding__half_up_in_won(t *testing.T) {
 		if got := CalculateFee(c.amount, DefaultFeeRateBps); got != c.want {
 			t.Errorf("CalculateFee(%d) = %d, want %d", c.amount, got, c.want) // Errorf: 실패 기록 후 계속 진행
 		}
+	}
+
+	// float 가 실제로 틀리는 예: 5,750원 × 2.2% = 126.5 → 127 이어야 한다.
+	// 변수에 담아야 런타임 float64 연산이 된다.
+	// (5750 * 0.022 처럼 상수끼리 쓰면 Go 는 컴파일 시점에 정확히 계산한다)
+	amount, rate := 5750.0, 0.022
+	if f := math.Round(amount * rate); f != 126 {
+		t.Fatalf("float64: 126.49999999999999 → 126 기대: %v", f)
+	}
+	if got := CalculateFee(5750, 220); got != 127 {
+		t.Fatalf("정수식은 127: %d", got)
 	}
 }
 
@@ -281,8 +293,98 @@ func Test_trial_balance__sum_of_balances_is_zero(t *testing.T) {
 	if rep.SumOfBalances != 0 || rep.TotalDebit != rep.TotalCredit {
 		t.Fatalf("시산표: 잔액 합 0, 차변 합 = 대변 합 이어야 한다: %+v", rep)
 	}
+	// 잔액 캐시(balance) = 라인으로 다시 계산한 값(차변 합 - 대변 합)
+	for _, l := range rep.TrialBalance {
+		if l.Balance != l.DebitTotal-l.CreditTotal {
+			t.Fatalf("%s: 캐시 잔액 %d != 라인 합 %d",
+				l.AccountID, l.Balance, l.DebitTotal-l.CreditTotal)
+		}
+	}
 	if len(rep.Merchants) != 2 || rep.Merchants[0].Status != "PAID" {
 		t.Fatalf("가맹점별 리포트 2줄, PAID: %+v", rep.Merchants)
+	}
+}
+
+// D1: 같은 결제가 두 번 기록돼도(05 의 중복 메시지) 원천 거래는 1행.
+// 원천 거래가 2행이 되면 원장은 맞는데 정산 gross 가 2배가 된다.
+func Test_same_payment_recorded_twice__single_transaction_row(
+	t *testing.T,
+) {
+	f := newFixture(t)
+	ctx := context.Background()
+	at := kst(2026, 11, 8, 10, 0)
+	must(t)(f.txs.RecordPayment(ctx, "m1", "pg-1", 10000, at))
+	must(t)(f.txs.RecordPayment(ctx, "m1", "pg-1", 10000, at))
+
+	if n := queryInt(t, `SELECT count(*) FROM transactions`); n != 1 {
+		t.Fatalf("transactions 1행 기대: %d", n)
+	}
+	sts, err := f.settle.Settle(ctx, nov8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sts) != 1 || sts[0].GrossAmount != 10000 {
+		t.Fatalf("정산 gross 10000 (2배 아님): %+v", sts)
+	}
+}
+
+// D2: 정산이 집계한 뒤 settlement_id 를 찍기 전에 같은 날 거래가
+// 커밋되면, 그 거래는 집계에 없으므로 "정산됨" 표시도 없어야 한다.
+func Test_late_transaction_during_settle__not_marked_settled(
+	t *testing.T,
+) {
+	f := newFixture(t)
+	ctx := context.Background()
+	must(t)(f.txs.RecordPayment(ctx, "m1", "pg-1", 10000,
+		kst(2026, 11, 8, 10, 0)))
+
+	// 집계 직후 다른 커넥션(풀)에서 늦은 거래를 커밋한다.
+	f.settle.afterAggregate = func() {
+		must(t)(f.txs.RecordPayment(ctx, "m1", "pg-late", 5000,
+			kst(2026, 11, 8, 23, 0)))
+	}
+	sts, err := f.settle.Settle(ctx, nov8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sts) != 1 || sts[0].GrossAmount != 10000 {
+		t.Fatalf("집계는 늦은 거래 전 10000: %+v", sts)
+	}
+	late := queryInt(t, `SELECT count(*) FROM transactions
+		WHERE pg_tx_id = 'pg-late' AND settlement_id IS NOT NULL`)
+	if late != 0 {
+		t.Fatal("집계 안 된 늦은 거래가 정산됨으로 표시됐다")
+	}
+	// 정산됨 표시된 거래의 합 = 정산 gross (정산과 거래의 대사)
+	marked := queryInt(t, `SELECT coalesce(sum(amount), 0)
+		FROM transactions WHERE settlement_id = $1`, sts[0].ID)
+	if marked != sts[0].GrossAmount {
+		t.Fatalf("표시된 거래 합 %d != gross %d",
+			marked, sts[0].GrossAmount)
+	}
+}
+
+// D4: 모르는 계정 ID 는 조용히 ASSET 으로 만들지 않고 거부한다.
+// (오타 난 계정에 돈이 쌓이면 시산표 합은 0 이라 알아채기 어렵다)
+func Test_unknown_account__rejected(t *testing.T) {
+	f := newFixture(t)
+	_, err := f.ledger.Post(context.Background(), JournalEntry{
+		ReferenceType: RefPgDeposit, ReferenceID: "dep-typo",
+		Lines: []Line{
+			Dr("bank:cahs", 1000), // 오타
+			Cr(AccountPgReceivable, 1000),
+		},
+	})
+	if !errors.Is(err, ErrUnknownAccount) {
+		t.Fatalf("ErrUnknownAccount 기대: %v", err)
+	}
+	if n := queryInt(t, `SELECT count(*) FROM journal_entries`); n != 0 {
+		t.Fatalf("아무것도 기록되지 않아야 한다: %d", n)
+	}
+	n := queryInt(t,
+		`SELECT count(*) FROM ledger_accounts WHERE id = 'bank:cahs'`)
+	if n != 0 {
+		t.Fatal("오타 계정이 만들어지면 안 된다")
 	}
 }
 

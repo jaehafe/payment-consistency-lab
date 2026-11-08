@@ -121,6 +121,10 @@ func (w *PessimisticWithdraw) Withdraw(ctx context.Context, accountID string, am
 	}
 	time.Sleep(w.ReadWriteDelay)
 
+	// 나이브와 똑같이 "읽은 값 - amount" 를 절대값으로 쓴다 (Kotlin 은 balance - ?).
+	// 일부러 그렇게 했다: 안전하게 만드는 건 오직 FOR UPDATE 라는 걸 보이려고.
+	// FOR UPDATE 를 지우면 이 함수는 나이브와 같아져 10건 성공·잔액 0 (lost update).
+	// (Kotlin 은 지우면 10건 성공·잔액 -9,000 — 초과 인출이지만 합계는 맞음)
 	if _, err := tx.Exec(ctx, `UPDATE accounts SET balance = $2 WHERE id = $1`, accountID, balance-amount); err != nil {
 		return "", err
 	}
@@ -133,13 +137,26 @@ func (w *PessimisticWithdraw) Withdraw(ctx context.Context, accountID string, am
 	return Success, nil
 }
 
+// defaultMaxAttempts 는 MaxAttempts 를 안 정했을 때(0) 쓰는 값. Kotlin 과 같다.
+const defaultMaxAttempts = 20
+
+// attemptsOrDefault: 구조체 zero value(MaxAttempts=0)여도 동작하게 한다.
+func attemptsOrDefault(n int) int {
+	if n <= 0 {
+		return defaultMaxAttempts
+	}
+	return n
+}
+
 // ---------------------------------------------------------------------------
 // 3) OptimisticWithdraw: version 컬럼으로 "내가 읽은 뒤 아무도 안 바꿨을 때만" 쓴다.  ✅ (재시도 필요)
 // ---------------------------------------------------------------------------
 
 type OptimisticWithdraw struct {
-	DB             *pgxpool.Pool
-	MaxRetries     int
+	DB *pgxpool.Pool
+	// MaxAttempts: 첫 시도를 "포함한" 총 시도 횟수 (Kotlin maxAttempts 와 같은 의미).
+	// 3 이면 첫 시도 1 + 재시도 2. 0 이면 defaultMaxAttempts.
+	MaxAttempts    int
 	ReadWriteDelay time.Duration
 	// Retries: 지금까지 재시도한 총 횟수 (테스트/관측용).
 	// atomic.Int64 는 여러 goroutine 이 동시에 Add 해도 안전한 정수 (Kotlin의 AtomicLong).
@@ -150,7 +167,7 @@ type OptimisticWithdraw struct {
 var ErrTooManyRetries = errors.New("too many retries")
 
 func (w *OptimisticWithdraw) Withdraw(ctx context.Context, accountID string, amount int64) (Result, error) {
-	for attempt := 0; attempt <= w.MaxRetries; attempt++ {
+	for attempt := 0; attempt < attemptsOrDefault(w.MaxAttempts); attempt++ {
 		if attempt > 0 {
 			w.Retries.Add(1)
 		}
@@ -207,13 +224,13 @@ func (w *OptimisticWithdraw) try(ctx context.Context, accountID string, amount i
 
 type SerializableWithdraw struct {
 	DB             *pgxpool.Pool
-	MaxRetries     int
+	MaxAttempts    int // 첫 시도 포함 총 시도 횟수. 0 이면 defaultMaxAttempts
 	ReadWriteDelay time.Duration
 	Retries        atomic.Int64
 }
 
 func (w *SerializableWithdraw) Withdraw(ctx context.Context, accountID string, amount int64) (Result, error) {
-	for attempt := 0; attempt <= w.MaxRetries; attempt++ {
+	for attempt := 0; attempt < attemptsOrDefault(w.MaxAttempts); attempt++ {
 		if attempt > 0 {
 			w.Retries.Add(1)
 		}

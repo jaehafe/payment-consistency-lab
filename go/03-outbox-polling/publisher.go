@@ -15,7 +15,15 @@ import (
 // 같은 시그니처의 메서드만 가지고 있으면 자동으로 이 인터페이스를 만족한다 (덕 타이핑의 정적 버전).
 // Kotlin으로 치면 interface EventPublisher { fun publish(...) } 인데 `: EventPublisher` 를 안 써도 되는 것.
 type EventPublisher interface {
-	Publish(ctx context.Context, key, messageID string, payload []byte) error
+	Publish(ctx context.Context, msg Message) error
+}
+
+// Message 는 outbox 한 행을 Kafka 메시지로 옮긴 것.
+type Message struct {
+	Key       string // Kafka key = aggregate_id (orderId)
+	ID        string // 헤더 message_id = outbox.id
+	EventType string // 헤더 event_type (예: PaymentCompleted)
+	Payload   []byte // 메시지 value (JSON)
 }
 
 // KafkaPublisher 는 franz-go 클라이언트로 동기 발행한다.
@@ -25,13 +33,19 @@ type KafkaPublisher struct {
 }
 
 // Publish 는 브로커가 받았다고 응답(acks=all)할 때까지 기다린다.
-func (p *KafkaPublisher) Publish(ctx context.Context, key, messageID string, payload []byte) error {
-	// &kgo.Record{...} : 구조체를 만들고 그 주소(포인터)를 얻는다. Kotlin의 Record(...) 생성과 비슷.
+func (p *KafkaPublisher) Publish(ctx context.Context, msg Message) error {
+	// &kgo.Record{...} : 구조체를 만들고 그 주소(포인터)를 얻는다.
+	// Kotlin의 Record(...) 생성과 비슷.
 	rec := &kgo.Record{
-		Topic:   p.Topic,
-		Key:     []byte(key), // 메시지 key = orderId → 같은 주문의 이벤트는 같은 파티션으로 가서 순서가 보장된다.
-		Value:   payload,
-		Headers: []kgo.RecordHeader{{Key: "message_id", Value: []byte(messageID)}},
+		Topic: p.Topic,
+		// key = orderId → 같은 주문의 이벤트는 같은 파티션 → 순서 보장
+		Key:   []byte(msg.Key),
+		Value: msg.Payload,
+		// 헤더는 Kotlin 03, 04(Debezium) 와 같다.
+		Headers: []kgo.RecordHeader{
+			{Key: "message_id", Value: []byte(msg.ID)},
+			{Key: "event_type", Value: []byte(msg.EventType)},
+		},
 	}
 	// ProduceSync 는 결과 묶음을 돌려주고, FirstErr() 로 첫 에러를 꺼낸다.
 	return p.Client.ProduceSync(ctx, rec).FirstErr()
@@ -52,12 +66,12 @@ type ToggleablePublisher struct {
 
 func (p *ToggleablePublisher) SetDown(down bool) { p.down.Store(down) }
 
-func (p *ToggleablePublisher) Publish(ctx context.Context, key, messageID string, payload []byte) error {
+func (p *ToggleablePublisher) Publish(ctx context.Context, msg Message) error {
 	if p.down.Load() {
 		return ErrBrokerDown
 	}
 	if p.Delay > 0 {
 		time.Sleep(p.Delay)
 	}
-	return p.Inner.Publish(ctx, key, messageID, payload)
+	return p.Inner.Publish(ctx, msg)
 }

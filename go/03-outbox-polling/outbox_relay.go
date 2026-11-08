@@ -21,13 +21,6 @@ type OutboxRelay struct {
 	CrashAfterPublish atomic.Bool // 실패 주입 스위치
 }
 
-// outboxRow 는 outbox 한 행에서 발행에 필요한 부분.
-type outboxRow struct {
-	ID          string
-	AggregateID string
-	Payload     []byte
-}
-
 // RelayOnce 는 최대 batchSize 개를 발행하고, 발행한 개수를 돌려준다.
 func (r *OutboxRelay) RelayOnce(ctx context.Context, batchSize int) (int, error) {
 	tx, err := r.DB.Begin(ctx)
@@ -40,8 +33,10 @@ func (r *OutboxRelay) RelayOnce(ctx context.Context, batchSize int) (int, error)
 	//  - FOR UPDATE: 고른 행을 이 트랜잭션이 끝날 때까지 잠근다.
 	//  - SKIP LOCKED: 다른 릴레이가 이미 잠근 행은 기다리지 않고 "건너뛴다".
 	// → 릴레이 인스턴스를 여러 개 띄워도 같은 행을 두 번 집지 않고, 서로 기다리지도 않는다 (수평 확장 가능).
+	// 중복을 막는 건 FOR UPDATE 다. SKIP LOCKED 만 빼면 기다릴 뿐 중복은 없고,
+	// FOR UPDATE 까지 빼면 두 릴레이가 같은 행을 읽어 중복 발행한다.
 	rows, err := tx.Query(ctx, `
-		SELECT id::text, aggregate_id, payload
+		SELECT id::text, aggregate_id, event_type, payload
 		  FROM outbox
 		 WHERE published_at IS NULL
 		 ORDER BY created_at
@@ -50,10 +45,13 @@ func (r *OutboxRelay) RelayOnce(ctx context.Context, batchSize int) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	var batch []outboxRow // nil 슬라이스로 시작해도 append 할 수 있다 (Kotlin의 mutableListOf())
-	for rows.Next() {     // rows.Next() 가 false 가 될 때까지 = JDBC ResultSet.next() 와 같다
-		var o outboxRow
-		if err := rows.Scan(&o.ID, &o.AggregateID, &o.Payload); err != nil {
+	// nil 슬라이스로 시작해도 append 할 수 있다 (Kotlin의 mutableListOf())
+	var batch []Message
+	// rows.Next() 가 false 가 될 때까지 = JDBC ResultSet.next() 와 같다
+	for rows.Next() {
+		var o Message
+		err := rows.Scan(&o.ID, &o.Key, &o.EventType, &o.Payload)
+		if err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -71,7 +69,7 @@ func (r *OutboxRelay) RelayOnce(ctx context.Context, batchSize int) (int, error)
 	for _, o := range batch {            // _ 는 인덱스를 안 쓴다는 뜻
 		// 동기 발행 (acks=all). 브로커가 확실히 받은 것만 "발행됨"으로 표시하기 위해서다.
 		// 실패하면 return → tx 롤백 → 잠금이 풀리고 published_at 은 여전히 NULL → 다음 주기에 재시도.
-		if err := r.Publisher.Publish(ctx, o.AggregateID, o.ID, o.Payload); err != nil {
+		if err := r.Publisher.Publish(ctx, o); err != nil {
 			return 0, err
 		}
 		ids = append(ids, o.ID)
@@ -92,10 +90,14 @@ func (r *OutboxRelay) RelayOnce(ctx context.Context, batchSize int) (int, error)
 	return len(batch), nil
 }
 
-// Run 은 ctx 가 취소될 때까지 interval 마다 RelayOnce 를 반복한다 (cmd/main.go 에서 사용).
-func (r *OutboxRelay) Run(ctx context.Context, interval time.Duration, batchSize int) {
-	ticker := time.NewTicker(interval) // interval 마다 신호를 보내는 채널 (Spring의 @Scheduled(fixedDelay) 역할)
-	defer ticker.Stop()
+// Run 은 ctx 가 취소될 때까지 RelayOnce 를 반복한다 (cmd/main.go 에서 사용).
+//
+// Kotlin 03 의 @Scheduled(fixedDelay) 와 같게: "이전 실행이 끝난 뒤"
+// interval 만큼 쉰다. (time.Ticker 는 시작 시각 기준으로 interval 마다
+// 신호를 보내므로 fixedRate 에 가깝다 — 오래 걸린 회차 뒤엔 바로 또 돈다.)
+func (r *OutboxRelay) Run(
+	ctx context.Context, interval time.Duration, batchSize int,
+) {
 	for {
 		// 밀린 게 있으면 쉬지 않고 계속 비운다.
 		for {
@@ -108,10 +110,12 @@ func (r *OutboxRelay) Run(ctx context.Context, interval time.Duration, batchSize
 				break
 			}
 		}
+		// select: 여러 채널 중 먼저 값이 오는 쪽을 실행 (Kotlin의 select { })
+		// time.After(d): d 뒤에 값이 한 번 오는 채널 = "지금부터 d 쉬기"
 		select {
 		case <-ctx.Done(): // 종료 신호
 			return
-		case <-ticker.C: // 다음 주기
+		case <-time.After(interval): // 다 비운 시점부터 interval 뒤
 		}
 	}
 }

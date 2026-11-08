@@ -13,7 +13,7 @@ import java.time.Instant
  * "이벤트가 없다"도 타임아웃 대기 없이 확정적으로 판단할 수 있다.
  */
 class EventProbe(private val bootstrapServers: String, private val topic: String) {
-    data class Received(val key: String, val value: String, val messageId: String?)
+    data class Received(val key: String, val value: String, val messageId: String?, val eventType: String?)
 
     fun eventsFor(key: String): List<Received> = events { it.key == key }
 
@@ -37,7 +37,8 @@ class EventProbe(private val bootstrapServers: String, private val topic: String
                 check(Instant.now() < deadline) { "토픽 끝까지 읽지 못함" }
                 for (r in consumer.poll(Duration.ofMillis(200))) {
                     val messageId = r.headers().lastHeader("message_id")?.value()?.let { String(it) }
-                    val received = Received(r.key(), r.value(), messageId)
+                    val eventType = r.headers().lastHeader("event_type")?.value()?.let { String(it) }
+                    val received = Received(r.key(), r.value(), messageId, eventType)
                     if (filter(received)) out += received
                 }
             }

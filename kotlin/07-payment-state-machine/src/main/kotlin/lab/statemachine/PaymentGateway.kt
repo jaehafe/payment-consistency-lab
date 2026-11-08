@@ -43,6 +43,9 @@ class FakePaymentGateway : PaymentGateway {
     /** 조회 API 자체가 안 됨 (PG 장애) */
     @Volatile var statusUnavailable = false
 
+    /** 테스트 훅: 취소 요청이 PG에 도착한 순간 호출 (경쟁 상황을 결정적으로 재현하기 위해) */
+    @Volatile var onCancel: ((pgTxId: String) -> Unit)? = null
+
     private data class Record(val pgTxId: String, val code: PgStatusCode, @Volatile var canceled: Boolean = false)
 
     private val records = ConcurrentHashMap<String, Record>()
@@ -72,6 +75,7 @@ class FakePaymentGateway : PaymentGateway {
 
     override fun cancel(pgTxId: String) {
         if (failCancel) throw PgException("PG 장애 주입: 취소 실패")
+        onCancel?.invoke(pgTxId)
         val r = records.values.first { it.pgTxId == pgTxId }
         if (!r.canceled) {
             r.canceled = true
@@ -89,6 +93,7 @@ class FakePaymentGateway : PaymentGateway {
         declineCharge = false
         failCancel = false
         statusUnavailable = false
+        onCancel = null
         records.clear()
         chargeCount.set(0)
         cancelCount.set(0)

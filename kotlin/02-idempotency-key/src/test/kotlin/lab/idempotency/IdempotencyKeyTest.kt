@@ -85,8 +85,13 @@ class IdempotencyKeyTest {
 
         val statuses = responses.map { it.statusCode.value() }
         println("동시 요청 응답 코드: $statuses")
-        assertTrue(statuses.all { it == 201 || it == 409 }, "201(처리/재생) 또는 409(처리 중)만 나와야 한다: $statuses")
+        // 불변식은 "PG 승인 1회"다. 201의 개수는 "처리한 1건 + 처리가 끝난 뒤 도착해 저장된 응답을 재생받은 요청"이라
+        // 타이밍에 따라 1보다 클 수 있다 → ==1 로 단언하지 않는다 (보통은 201×1, 409×9).
+        assertTrue(statuses.all { it == 201 || it == 409 }, "201(처리/재생) 또는 409(처리 중)만, 5xx 없음: $statuses")
+        assertTrue(statuses.count { it == 201 } >= 1, "적어도 1건은 처리되어 201: $statuses")
         assertTrue(statuses.count { it == 409 } >= 1, "경합이 실제로 일어나 409가 있어야 한다: $statuses")
+        val createdBodies = responses.filter { it.statusCode.value() == 201 }.map { json(it.body) }.distinct()
+        assertEquals(1, createdBodies.size, "201 응답들은 모두 같은 결제(같은 바디)여야 한다: $createdBodies")
         assertEquals(1, pg.callCount(), "Phase 1 잠금 덕분에 PG 호출 자체가 한 번뿐")
         assertEquals(1, pg.chargeCount())
         assertEquals(1, payments.countByOrderId(orderId))

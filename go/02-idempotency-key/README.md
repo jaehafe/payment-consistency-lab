@@ -26,17 +26,18 @@ Phase 3 (tx)  응답 저장 + 잠금 해제                  recovery_point = fi
 
 - **왜 PG 호출이 트랜잭션 밖인가?** PG 에서 일어난 승인은 DB 롤백으로 되돌릴 수 없다. tx 안에 넣어도 원자성이 생기지 않고, 느린 외부 호출 동안 DB 커넥션·행 잠금만 오래 쥐게 된다. 대신 **PG 자체의 멱등성**(같은 key 면 새로 승인하지 않음)에 기댄다.
 - **실패하면?** 잠금을 풀고(`locked_at = NULL`) 503 을 준다. 클라이언트가 같은 key 로 재시도하면 `recovery_point` 부터 이어서 실행한다.
-- **동시 요청은?** Phase 1 의 `INSERT ... ON CONFLICT DO NOTHING` + `SELECT ... FOR UPDATE` 로 같은 key 요청들이 한 줄로 서고, 먼저 잠근 하나만 진행하고 나머지는 409.
+- **동시 요청은?** Phase 1 의 `INSERT ... ON CONFLICT DO NOTHING` + `SELECT ... FOR UPDATE` 로 같은 key 요청들이 한 줄로 서고, 먼저 잠근 하나만 진행한다. 처리 중에 온 요청은 409, 처리가 끝난 뒤 도착한 요청은 저장된 201 을 재생받는다. 보장되는 것은 **PG 호출·승인 1번**이고, 201/409 의 개수는 도착 타이밍에 따라 달라질 수 있다 (테스트에선 보통 201×1, 409×9).
+- **Kotlin 과의 차이 (Phase 1)**: Kotlin 은 새 key 를 INSERT 할 때 `locked_at=now()` 를 넣고 바로 반환하고, Go 는 `locked_at` 없이 넣은 뒤 공통 경로(`FOR UPDATE` → 판정 → `UPDATE locked_at`)를 탄다. 셋이 한 트랜잭션으로 커밋되므로 다른 요청이 잠기지 않은 새 행을 보는 순간이 없어 동작은 같다.
 - **프로세스가 죽어 잠금이 남으면?** `locked_at` 이 `LockTimeout`(기본 30초)보다 오래되면 다음 요청이 잠금을 가져간다.
 
 ## 핵심 코드 위치
 
 - `service.go:70` `Pay` — 전체 흐름. `:88-90` 실패 시 잠금 해제
-- `service.go:130` `lockKey` (Phase 1) — `:143` `ON CONFLICT DO NOTHING`, `:156` `FOR UPDATE`, `:164` 422, `:167` 409
+- `service.go:130` `lockKey` (Phase 1) — `:141` Kotlin 과의 차이, `:151` `ON CONFLICT DO NOTHING`, `:164` `FOR UPDATE`, `:171` 422, `:175` 409
 - `service.go:97` `resume` — `recovery_point` 부터 이어서 실행. `:103` **PG 호출이 트랜잭션 밖인 이유**
-- `service.go:184` `savePayment` (Phase 2) — payments insert 와 `recovery_point` 전진을 한 tx 로
-- `service.go:205` `finish` (Phase 3) — `:230` `RETURNING response_body` 로 재시도 응답과 바이트 단위까지 동일하게
-- `gateway.go:40` Fake PG — `:56` PG 쪽 멱등성, `:65` `TimeoutAfterCharge`(승인됐는데 응답 유실)
+- `service.go:192` `savePayment` (Phase 2) — payments insert 와 `recovery_point` 전진을 한 tx 로
+- `service.go:213` `finish` (Phase 3) — `:238` `RETURNING response_body` 로 재시도 응답과 바이트 단위까지 동일하게
+- `gateway.go:41` Fake PG — `:62` PG 쪽 멱등성, `:71` `TimeoutAfterCharge`(승인됐는데 응답 유실), `:78` `ChargeCount`(실제 승인 수) / `:88` `CallCount`(호출 수)
 - `handler.go:13` 라우팅 (`"POST /payments"`, Go 1.22+ 패턴), `:44~` 에러 → 상태 코드 매핑
 
 ## 테스트 실행
@@ -48,13 +49,14 @@ go test ./02-idempotency-key/ -v
 
 | 테스트 | 증명하는 것 |
 |---|---|
-| `Test_same_key_twice__charged_once__same_response` | 같은 key 2번 → 둘 다 201, 바디 동일, PG 승인 1번 |
-| `Test_same_key_different_body__422` | 같은 key 로 금액만 바꿔 보내면 422 |
-| `Test_concurrent_same_key__only_one_charge` | goroutine 10개가 **동시에** 같은 key 로 요청 → PG 승인 1번, 나머지 409 |
-| `Test_pg_timeout_after_charge__retry_resumes__no_double_charge` | PG 승인 후 응답 유실 → 503 → 재시도 시 PG 멱등성으로 새 승인 없이 201 |
-| `Test_missing_header__400` | 헤더 없으면 400, PG 호출 없음 |
+| `Test_same_key_twice__charged_once__same_response` | 같은 key 2번 → 둘 다 201, 바디 동일, PG 호출 1번(두 번째는 PG 를 부르지도 않음) · 승인 1번 |
+| `Test_same_key_different_body__422` | 같은 key 로 금액만 바꿔 보내면 422, PG 추가 호출 없음 |
+| `Test_concurrent_same_key__only_one_charge` | goroutine 10개가 **동시에** 같은 key 로 요청 → PG **호출** 1번(우리 잠금이 막음) · 승인 1번, payments 1행, 응답은 201(≥1, 모두 같은 결제) 또는 409(≥1)뿐 — 5xx 없음 |
+| `Test_pg_timeout_after_charge__retry_resumes__no_double_charge` | PG 승인 후 응답 유실 → 503, key 는 `started` + 잠금 해제 → 재시도 시 PG 호출 2번이지만 승인 1번(PG 멱등성이 막음), payments 1행, 201 |
+| `Test_missing_header__400` | 헤더 없으면 400, PG 호출 0번 |
 
 동시성 테스트는 Fake PG 에 300ms 지연을 주고, 채널을 `close` 해서 10개 goroutine 을 동시에 출발시킨다.
+`CallCount` 와 `ChargeCount` 를 같이 보면 "누가 막았나"가 구분된다: call=1·charge=1 은 **우리 서버**가, call=2·charge=1 은 **PG 멱등성**이 막은 것.
 
 ### 직접 띄워보기
 

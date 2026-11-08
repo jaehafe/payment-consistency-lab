@@ -30,6 +30,10 @@ func Test_same_key_twice__charged_once__same_response(t *testing.T) {
 	if n := app.gateway.ChargeCount(); n != 1 {
 		t.Fatalf("PG 승인은 1번이어야 하는데 %d번", n)
 	}
+	// 두 번째 요청은 finished → 저장된 응답. PG 를 부르지도 않는다.
+	if n := app.gateway.CallCount(); n != 1 {
+		t.Fatalf("PG 호출은 1번이어야 하는데 %d번", n)
+	}
 }
 
 func Test_same_key_different_body__422(t *testing.T) {
@@ -44,6 +48,9 @@ func Test_same_key_different_body__422(t *testing.T) {
 	}
 	if n := app.gateway.ChargeCount(); n != 1 {
 		t.Fatalf("PG 승인은 1번이어야 하는데 %d번", n)
+	}
+	if n := app.gateway.CallCount(); n != 1 {
+		t.Fatalf("422 요청은 PG 를 부르지 않는다: 호출 %d번", n)
 	}
 }
 
@@ -92,11 +99,18 @@ func Test_concurrent_same_key__only_one_charge(t *testing.T) {
 	}
 	t.Logf("201=%d, 409=%d", created, conflict)
 
+	// 불변식: PG 승인 1번. 그리고 그걸 막은 게 PG 멱등성이 아니라
+	// 우리 Phase 1 잠금이었는지 보려면 "호출" 횟수도 1이어야 한다.
+	if got := app.gateway.CallCount(); got != 1 {
+		t.Fatalf("Phase 1 잠금으로 PG 호출 자체가 1번이어야 하는데 %d번", got)
+	}
 	if got := app.gateway.ChargeCount(); got != 1 {
 		t.Fatalf("동시 요청 %d개 중 PG 승인은 1번이어야 하는데 %d번", n, got)
 	}
+	// 201 은 "처리한 1건 + (늦게 도착해 저장된 응답을 재생받은 요청)" 이라
+	// 정확히 1개라고 단언할 수 없다. 보통은 201×1, 409×9.
 	if created < 1 || conflict < 1 {
-		t.Fatalf("최소 1개의 201 과 1개 이상의 409 가 나와야 한다 (201=%d, 409=%d)", created, conflict)
+		t.Fatalf("201 ≥1, 409 ≥1 이어야 한다 (201=%d, 409=%d)", created, conflict)
 	}
 	if cnt, _ := CountPayments(context.Background(), testPool, "order-1"); cnt != 1 {
 		t.Fatalf("payments 는 1행이어야 하는데 %d행", cnt)
@@ -118,6 +132,20 @@ func Test_pg_timeout_after_charge__retry_resumes__no_double_charge(t *testing.T)
 	if cnt, _ := CountPayments(context.Background(), testPool, "order-1"); cnt != 0 {
 		t.Fatalf("우리 DB 에는 아직 결제가 없다: %d", cnt)
 	}
+	// 1차 실패 후 key 상태: started 에 머물고, 잠금은 풀려 있어야 한다.
+	// (잠금이 남아 있으면 재시도가 LockTimeout 동안 409 를 받는다)
+	var rp string
+	var locked bool
+	err := testPool.QueryRow(context.Background(), `
+		SELECT recovery_point, locked_at IS NOT NULL
+		  FROM idempotency_keys WHERE idempotency_key = $1`,
+		"key-1").Scan(&rp, &locked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rp != RecoveryStarted || locked {
+		t.Fatalf("started + 잠금 해제 기대: rp=%s locked=%v", rp, locked)
+	}
 
 	// 2차 시도: 네트워크 복구 후 클라이언트가 같은 key 로 재시도.
 	// recovery_point=started 에서 이어서 PG 를 다시 부르지만, PG 멱등성 덕분에 새 승인 없이 기존 pgTxId 를 받는다.
@@ -126,8 +154,16 @@ func Test_pg_timeout_after_charge__retry_resumes__no_double_charge(t *testing.T)
 	if code != http.StatusCreated {
 		t.Fatalf("재시도는 201 이어야 한다: %d %s", code, b)
 	}
+	// 재시도는 started 부터 이어서 PG 를 "다시 부른다" (호출 2번).
+	// 그래도 승인은 1번 — 이번엔 PG 멱등성이 막은 것이다.
+	if n := app.gateway.CallCount(); n != 2 {
+		t.Fatalf("PG 호출은 2번이어야 한다: %d번", n)
+	}
 	if n := app.gateway.ChargeCount(); n != 1 {
 		t.Fatalf("이중 결제 발생! PG 승인 %d번", n)
+	}
+	if cnt, _ := CountPayments(context.Background(), testPool, "order-1"); cnt != 1 {
+		t.Fatalf("payments 는 1행이어야 한다: %d", cnt)
 	}
 	if r := decodeResponse(t, b); r.PgTxID == "" {
 		t.Fatal("pgTxId 가 있어야 한다")
@@ -140,7 +176,7 @@ func Test_missing_header__400(t *testing.T) {
 	if code != http.StatusBadRequest {
 		t.Fatalf("400 을 기대했지만 %d", code)
 	}
-	if n := app.gateway.ChargeCount(); n != 0 {
+	if n := app.gateway.CallCount(); n != 0 {
 		t.Fatalf("PG 는 호출되지 않아야 한다: %d", n)
 	}
 }

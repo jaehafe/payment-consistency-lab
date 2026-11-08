@@ -25,6 +25,7 @@ class SerializableWithdraw(
     }
 
     @Volatile var readWriteDelayMs = 0L
+    /** 첫 시도를 "포함한" 총 시도 횟수 (Go `MaxAttempts`와 같은 의미) */
     var maxAttempts = 20
 
     /** 테스트 관찰용: 40001로 재시도한 총 횟수 */

@@ -25,7 +25,13 @@ class ConsumerLoop(
     private val objectMapper: ObjectMapper,
 ) : AutoCloseable {
     /** 테스트 관찰용: 이 루프가 받은 메시지와 처리 여부 */
-    data class Delivery(val messageId: String, val orderId: String, val processed: Boolean)
+    data class Delivery(
+        val messageId: String,
+        val orderId: String,
+        val processed: Boolean,
+        val partition: Int,
+        val offset: Long,
+    )
 
     val deliveries: MutableList<Delivery> = CopyOnWriteArrayList()
 
@@ -42,10 +48,13 @@ class ConsumerLoop(
         if (records.isEmpty) return 0
 
         for (record in records) {
-            val messageId = String(record.headers().lastHeader("message_id").value())
+            // message_id가 없으면 중복 제거 키가 없으므로 처리할 수 없다 → 무엇이 빠졌는지 알 수 있게 실패한다.
+            // (offset은 커밋되지 않으므로 이 메시지는 계속 다시 온다 = poison message. README "한계" 참고)
+            val messageId = record.headers().lastHeader("message_id")?.value()?.let { String(it) }
+                ?: error("message_id 헤더 없음: ${record.topic()}-${record.partition()}@${record.offset()} (key=${record.key()})")
             val event = objectMapper.readValue<PaymentCompletedEvent>(record.value())
             val processed = handler.handle(messageId, event) // 리턴 시점에 DB 트랜잭션은 이미 커밋됨
-            deliveries += Delivery(messageId, event.orderId, processed)
+            deliveries += Delivery(messageId, event.orderId, processed, record.partition(), record.offset())
         }
 
         if (crashBeforeOffsetCommit) throw SimulatedCrashException()

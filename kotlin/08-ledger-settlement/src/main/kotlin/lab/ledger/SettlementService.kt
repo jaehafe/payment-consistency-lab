@@ -2,8 +2,11 @@ package lab.ledger
 
 import org.slf4j.LoggerFactory
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.jdbc.core.PreparedStatementSetter
+import org.springframework.jdbc.core.RowMapper
 import org.springframework.stereotype.Service
 import org.springframework.transaction.support.TransactionTemplate
+import java.sql.PreparedStatement
 import java.sql.Timestamp
 import java.time.LocalDate
 import java.util.UUID
@@ -27,6 +30,9 @@ class SettlementService(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
+    /** 테스트 전용 훅: 집계 직후, settlement_id를 찍기 전에 불린다. 그 사이 늦은 거래가 커밋되는 경쟁을 결정적으로 재현하려고 둔다. */
+    internal var afterAggregateHook: (() -> Unit)? = null
+
     /**
      * KST 거래일(date)의 미정산 거래를 가맹점별로 집계해 settlements를 만든다.
      * 같은 날짜로 다시 실행해도 중복이 생기지 않는다:
@@ -42,13 +48,16 @@ class SettlementService(
         // 1) 대상 거래 행을 잠근다: 정산 배치가 동시에 두 번 돌아도 같은 거래를 두 번 집계하지 않도록.
         //    (두 번째 배치는 여기서 기다렸다가, 첫 배치 커밋 후 settlement_id IS NULL 조건을 다시 평가해 0행이 된다)
         //    경계는 [KST 00:00, 다음날 KST 00:00) 반열린 구간. 23:59:59.999... 같은 끝값 처리 실수를 피한다.
-        jdbc.query(
+        //    잠근 id 목록을 받아 두고, 이후 집계와 settlement_id 기록은 이 목록으로만 한다.
+        val lockedIds: List<UUID> = jdbc.query(
             "SELECT id FROM transactions WHERE occurred_at >= ? AND occurred_at < ? AND settlement_id IS NULL FOR UPDATE",
-            { rs, _ -> rs.getString(1) }, fromTs, toTs,
+            { rs, _ -> rs.getObject(1, UUID::class.java) }, fromTs, toTs,
         )
 
         // 2) 가맹점별 집계. net = gross - refund - (결제 수수료 - 환불 수수료 환급)
-        val rows = jdbc.queryForList(
+        //    날짜 범위로 다시 찾지 않는다: READ COMMITTED는 문장마다 새 스냅샷이라,
+        //    1) 이후 커밋된 늦은 거래가 잠기지 않은 채 집계에 끼어든다.
+        val rows = jdbc.query(
             """
             SELECT merchant_id,
                    coalesce(sum(amount) FILTER (WHERE type = 'PAYMENT'), 0) AS gross,
@@ -56,18 +65,17 @@ class SettlementService(
                    coalesce(sum(fee) FILTER (WHERE type = 'PAYMENT'), 0)
                      - coalesce(sum(fee) FILTER (WHERE type = 'REFUND'), 0) AS fee
             FROM transactions
-            WHERE occurred_at >= ? AND occurred_at < ? AND settlement_id IS NULL
+            WHERE id = ANY(?)
             GROUP BY merchant_id
             ORDER BY merchant_id
             """.trimIndent(),
-            fromTs, toTs,
+            PreparedStatementSetter { ps -> ps.setArray(1, uuidArray(ps, lockedIds)) }, // ANY(?) = id in lockedIds
+            RowMapper { rs, _ -> MerchantAgg(rs.getString("merchant_id"), rs.getLong("gross"), rs.getLong("refund"), rs.getLong("fee")) },
         )
+        afterAggregateHook?.invoke()
 
         rows.mapNotNull { r ->
-            val merchantId = r["merchant_id"] as String
-            val gross = (r["gross"] as Number).toLong()
-            val refund = (r["refund"] as Number).toLong()
-            val fee = (r["fee"] as Number).toLong()
+            val (merchantId, gross, refund, fee) = r
             val s = Settlement(UUID.randomUUID(), merchantId, date, gross, refund, fee, gross - refund - fee, "CALCULATED")
 
             val inserted = jdbc.update(
@@ -85,10 +93,13 @@ class SettlementService(
                 return@mapNotNull null
             }
             // 3) 거래에 정산 id를 찍는다 (재실행 시 집계 대상에서 빠지는 근거)
-            jdbc.update(
-                "UPDATE transactions SET settlement_id = ? WHERE merchant_id = ? AND occurred_at >= ? AND occurred_at < ? AND settlement_id IS NULL",
-                s.id, merchantId, fromTs, toTs,
-            )
+            //    여기도 잠근(= 집계한) id로만. 날짜 범위로 찍으면 집계 후 커밋된 늦은 거래가
+            //    "금액엔 없는데 정산됨"으로 표시되어 영영 정산되지 않는다.
+            jdbc.update("UPDATE transactions SET settlement_id = ? WHERE id = ANY(?) AND merchant_id = ?") { ps ->
+                ps.setObject(1, s.id)
+                ps.setArray(2, uuidArray(ps, lockedIds))
+                ps.setString(3, merchantId)
+            }
             s
         }
     }!!
@@ -112,6 +123,11 @@ class SettlementService(
         }
         // net <= 0 (환불이 더 많은 날)이면 지급할 돈이 없다. 실무에선 다음 정산에서 상계하거나 가맹점에 청구한다.
     }
+
+    private data class MerchantAgg(val merchantId: String, val gross: Long, val refund: Long, val fee: Long)
+
+    private fun uuidArray(ps: PreparedStatement, ids: List<UUID>): java.sql.Array =
+        ps.connection.createArrayOf("uuid", ids.toTypedArray())
 
     fun find(id: UUID): Settlement = jdbc.queryForObject(
         "SELECT * FROM settlements WHERE id = ?",

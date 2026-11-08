@@ -17,7 +17,10 @@ const DefaultFeeRateBps = 300
 //	fee = (amount × rateBps + 5000) / 10000
 //
 // 정수 나눗셈은 버림이므로, 나누기 전에 절반(5000)을 더하면 반올림이 된다. 예) 1,050원 × 3% = 31.5 → 32원.
-// float 로 1050 * 0.03 을 계산하면 31.499999... 가 되어 31원이 나올 수 있다 → 금액에 float 금지.
+// float 는 틀릴 수 있다: 5,750원 × 2.2% 는 126.5 → 127원이어야 하는데,
+// float64 로 5750 * 0.022 = 126.49999999999999 → math.Round 는 126원.
+// → 금액에 float 금지.
+// (0.022 를 2진수로 정확히 표현할 수 없어서. 1050 * 0.03 은 우연히 정확히 31.5 가 나온다)
 func CalculateFee(amount, rateBps int64) int64 {
 	return (amount*rateBps + 5000) / 10000
 }
@@ -69,19 +72,29 @@ func (s *TransactionService) RecordRefund(ctx context.Context, merchantID, pgTxI
 }
 
 // record 는 원천 거래 insert 와 분개 전기를 한 트랜잭션으로 묶는다 (거래는 있는데 원장엔 없는 상태 방지).
+//
+// 순서가 중요하다: 분개를 먼저 전기하고, "새로 전기됐을 때만" 원천 거래를 넣는다.
+// 분개의 UNIQUE(reference_type, reference_id) 가 멱등성의 기준점이다.
+// 거래를 먼저 넣고 PostTx 의 false(이미 전기됨)를 무시하면, 같은 결제가 두 번 올 때
+// 원장은 1번인데 transactions 는 2행 → 그날 정산 gross 가 2배가 된다.
+// (Kotlin 의 `if (posted.created) insertTransaction(...)` 과 같다)
 func (s *TransactionService) record(ctx context.Context, t Transaction, e JournalEntry) error {
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	posted, err := PostTx(ctx, tx, e)
+	if err != nil {
+		return err
+	}
+	if !posted {
+		return nil // 이미 기록된 거래 (중복 메시지) → 아무것도 하지 않음
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO transactions (id, merchant_id, type, pg_tx_id, amount, fee, occurred_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		t.ID, t.MerchantID, t.Type, t.PgTxID, t.Amount, t.Fee, t.OccurredAt); err != nil {
-		return err
-	}
-	if _, err := PostTx(ctx, tx, e); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

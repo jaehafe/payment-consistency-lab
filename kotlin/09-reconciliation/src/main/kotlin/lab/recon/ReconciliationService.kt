@@ -5,6 +5,7 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.support.TransactionTemplate
 import java.time.LocalDate
+import java.util.Locale
 import java.util.UUID
 
 enum class DiscrepancyKind { MISSING_IN_INTERNAL, MISSING_IN_PG, AMOUNT_MISMATCH, DUPLICATE_IN_PG, DUPLICATE_IN_INTERNAL }
@@ -31,22 +32,25 @@ data class ReconReport(
     /** 차액 합계 (pg - internal). 0이 아니면 "장부상 돈이 맞지 않는다" */
     val totalDiffAmount: Long = discrepancies.sumOf { it.diffAmount }
 
+    /** 천 단위 콤마. "%,d"는 JVM 기본 로케일을 따라 독일 서버에선 1.234, 프랑스에선 1 234가 된다 → 고정 */
+    private fun won(v: Long?): String = String.format(Locale.KOREA, "%,d", v)
+
     fun toMarkdown(): String = buildString {
         appendLine("# 대사 리포트 $businessDate (KST)")
         appendLine()
         appendLine("- run_id: `$runId`")
         appendLine("- 일치: $matchedCount 건")
-        appendLine("- 불일치: ${discrepancies.size} 건, 차액 합계(PG - 내부): ${"%,d".format(totalDiffAmount)}원")
+        appendLine("- 불일치: ${discrepancies.size} 건, 차액 합계(PG - 내부): ${won(totalDiffAmount)}원")
         appendLine()
         appendLine("| 종류 | 건수 | 차액 합계 |")
         appendLine("|---|---:|---:|")
-        DiscrepancyKind.entries.forEach { appendLine("| $it | ${countsByKind[it]} | ${"%,d".format(diffByKind[it])} |") }
+        DiscrepancyKind.entries.forEach { appendLine("| $it | ${countsByKind[it]} | ${won(diffByKind[it])} |") }
         if (discrepancies.isNotEmpty()) {
             appendLine()
             appendLine("| 종류 | pg_tx_id | 내부 금액 | PG 금액 | 차액 |")
             appendLine("|---|---|---:|---:|---:|")
             discrepancies.forEach {
-                appendLine("| ${it.kind} | ${it.pgTxId} | ${it.internalAmount ?: "-"} | ${it.pgAmount ?: "-"} | ${"%,d".format(it.diffAmount)} |")
+                appendLine("| ${it.kind} | ${it.pgTxId} | ${it.internalAmount ?: "-"} | ${it.pgAmount ?: "-"} | ${won(it.diffAmount)} |")
             }
         }
     }

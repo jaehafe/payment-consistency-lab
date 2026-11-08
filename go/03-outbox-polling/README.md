@@ -19,18 +19,20 @@ OutboxRelay.RelayOnce       tx { SELECT ... FOR UPDATE SKIP LOCKED
 
 - 브로커가 죽어 있어도 결제는 성공한다. 이벤트는 outbox 에 안전하게 남아 있다가 복구 후 나간다.
 - `FOR UPDATE SKIP LOCKED`: 릴레이를 여러 개 띄워도 서로 다른 행을 집는다 (기다리지도, 중복으로 집지도 않음).
+  중복을 막는 건 `FOR UPDATE` 쪽이다. `SKIP LOCKED` 만 빼면 두 번째 릴레이가 기다릴 뿐 중복은 없고, 절 전체를 빼면 중복 발행된다.
 - **at-least-once**: "발행 성공 → published_at 갱신 커밋" 사이에서 죽으면 재시작 후 다시 보낸다. **중복은 피할 수 없다.**
   그래서 outbox.id 를 Kafka 헤더 `message_id` 로 실어 보내고, 컨슈머가 이걸로 중복을 걸러낸다 → [05](../05-idempotent-consumer).
 
 ## 핵심 코드 위치
 
 - `payment_service.go:26` `Pay` — `:41~68` **트랜잭션 경계**, `:62` 실패 주입(롤백)
-- `outbox_relay.go:32` `RelayOnce`
-  - `:39-49` `FOR UPDATE SKIP LOCKED` 와 그 이유
-  - `:74` 동기 발행. 실패 시 return → tx 롤백 → 다음 주기 재시도
-  - `:80-82` **at-least-once 의 근원** (발행 후 마킹 전 크래시 지점)
-  - `:86` `published_at` 갱신
-- `outbox_relay.go:96` `Run` — 주기 실행 루프 (`time.Ticker`)
+- `outbox_relay.go:25` `RelayOnce`
+  - `:32-44` `FOR UPDATE SKIP LOCKED` 와 그 이유
+  - `:72` 동기 발행. 실패 시 return → tx 롤백 → 다음 주기 재시도
+  - `:80` **at-least-once 의 근원** (발행 후 마킹 전 크래시 지점)
+  - `:84` `published_at` 갱신
+- `outbox_relay.go:98` `Run` — 주기 실행 루프. Kotlin 의 `@Scheduled(fixedDelay)` 처럼 "다 비운 뒤 interval 쉬기" (`time.After`)
+- `publisher.go:36` `KafkaPublisher.Publish` — 동기 발행, 헤더 `message_id`(= outbox.id) / `event_type`
 - `schema.sql` — `published_at IS NULL` 부분 인덱스
 
 ## 테스트 실행
@@ -44,8 +46,8 @@ go test ./03-outbox-polling/ -v
 |---|---|
 | `Test_pay__writes_payment_and_outbox_atomically` | 결제 1건 → payments 1행 + outbox 1행(미발행) |
 | `Test_pay__db_failure__no_payment_no_outbox` | 커밋 실패 → 둘 다 0행 (01 과 달리 불일치 없음) |
-| `Test_broker_down__payment_saved__event_delivered_after_recovery` | 브로커 장애 중 결제 성공, 릴레이 실패, 복구 후 1건 전달 |
-| `Test_two_relays_concurrently__each_event_published_once` | goroutine 2개로 릴레이 동시 실행 → 30건이 정확히 한 번씩, 두 릴레이가 나눠서 처리 |
+| `Test_broker_down__payment_saved__event_delivered_after_recovery` | 브로커 장애 중 결제 성공, 릴레이 실패, 복구 후 1건 전달 (`message_id`/`event_type` 헤더 포함) |
+| `Test_two_relays_concurrently__each_event_published_once` | goroutine 2개로 릴레이 동시 실행 → 30건이 정확히 한 번씩, 두 릴레이 모두 1건 이상 처리 (정확히 반반은 아님) |
 | `Test_crash_after_publish_before_mark__event_published_twice` | 발행 후 마킹 전 크래시 → 같은 `message_id` 메시지가 토픽에 2건 |
 
 ### 직접 띄워보기

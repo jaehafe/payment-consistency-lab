@@ -164,6 +164,58 @@ func Test_same_file_imported_twice__ignored(t *testing.T) {
 	}
 }
 
+func Test_same_file_with_different_line_endings__ignored(t *testing.T) {
+	f := newFixture(t)
+	lf, err := os.ReadFile("testdata/pg_settlement_2026-11-08.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 같은 내용을 Windows 에서 다시 저장해 CRLF + 끝 개행이 하나 더 붙고
+	// 줄 끝에 공백까지 붙은 재전송 (Kotlin 테스트와 같은 정규화 범위)
+	crlf := strings.ReplaceAll(string(lf), "\n", "  \r\n") + "\r\n"
+
+	first := f.importCSV(t, "a.csv", string(lf))
+	second := f.importCSV(t, "a.crlf.csv", crlf)
+
+	if first.Skipped || !second.Skipped {
+		t.Fatalf("줄바꿈만 다른 파일은 skip: %+v / %+v", first, second)
+	}
+	n := queryInt(t, `SELECT count(*) FROM pg_settlement_records`)
+	if n != 7 {
+		t.Fatalf("레코드 7행: %d", n)
+	}
+}
+
+// KST 11-08 = [11-08 00:00+09, 11-09 00:00+09). 같은 거래인데 한쪽만 경계를 넘는다.
+func Test_kst_day_boundary__only_records_inside_day_counted(t *testing.T) {
+	f := newFixture(t)
+	// pg-start: 내부는 정확히 시작 시각(포함), PG 는 1초 전(전날)
+	// pg-end:   내부는 정확히 끝 시각(제외), PG 는 1초 전(포함)
+	exec(t, `INSERT INTO internal_transactions
+		(id, pg_tx_id, order_id, type, amount, occurred_at) VALUES
+		($1, 'pg-start', 'o-s', 'PAYMENT', 1000, '2026-11-08T00:00:00+09:00'),
+		($2, 'pg-end',   'o-e', 'PAYMENT', 2000, '2026-11-09T00:00:00+09:00')`,
+		uuid.NewString(), uuid.NewString())
+	f.importCSV(t, "b.csv", csvHead+
+		"pg-start,o-s,PAYMENT,1000,30,2026-11-07T23:59:59+09:00\n"+
+		"pg-end,o-e,PAYMENT,2000,60,2026-11-08T23:59:59+09:00\n")
+
+	rep := f.run(t)
+	if rep.Matched != 0 || len(rep.Discrepancies) != 2 {
+		t.Fatalf("일치 0, 불일치 2 기대: %+v", rep)
+	}
+	// compare_by_pg_tx_id 는 pg_tx_id 순 → pg-end, pg-start
+	end, start := rep.Discrepancies[0], rep.Discrepancies[1]
+	if end.PgTxID != "pg-end" || end.Kind != MissingInInternal ||
+		end.DiffAmount != 2000 {
+		t.Fatalf("pg-end 는 MISSING_IN_INTERNAL +2000: %+v", end)
+	}
+	if start.PgTxID != "pg-start" || start.Kind != MissingInPG ||
+		start.DiffAmount != -1000 {
+		t.Fatalf("pg-start 는 MISSING_IN_PG -1000: %+v", start)
+	}
+}
+
 func Test_report__summarizes_counts_and_diff_amount(t *testing.T) {
 	f := newFixture(t)
 	content, err := os.ReadFile("testdata/pg_settlement_2026-11-08.csv")

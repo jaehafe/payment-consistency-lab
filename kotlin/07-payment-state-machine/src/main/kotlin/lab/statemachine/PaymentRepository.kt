@@ -63,11 +63,14 @@ class PaymentRepository(private val jdbc: JdbcTemplate) {
      * FOR UPDATE SKIP LOCKED로 다른 janitor와 겹치지 않게 고르고, next_retry_at을 lease만큼 미뤄 둔 뒤 바로 커밋한다.
      * → PG 조회(느린 외부 호출) 동안 DB 트랜잭션/행 잠금을 쥐고 있지 않아도, 다른 janitor가 같은 행을 다시 집지 않는다.
      *   (janitor가 처리 도중 죽으면 lease가 지난 뒤 다른 janitor가 이어받는다)
+     * attempt_count도 여기서(커밋과 함께) 1 올린다. 처리 도중 죽어도 시도로 남으므로,
+     * 처리할 때마다 죽는 행이 lease 만료 → 재claim을 영원히 반복하지 않는다 (Janitor가 maxAttempts 초과로 보류시킨다).
+     * 반환되는 Payment.attemptCount는 이번 시도를 포함한 값이다.
      */
     fun claimDue(status: PaymentStatus, now: Instant, leaseUntil: Instant, limit: Int): List<Payment> =
         jdbc.query(
             """
-            UPDATE payments SET next_retry_at = ?
+            UPDATE payments SET next_retry_at = ?, attempt_count = attempt_count + 1
             WHERE id IN (
               SELECT id FROM payments
               WHERE status = ? AND next_retry_at <= ?
@@ -90,8 +93,4 @@ class PaymentRepository(private val jdbc: JdbcTemplate) {
             """.trimIndent(),
             attemptCount, Timestamp.from(nextRetryAt), lastError, id, expected.name,
         )
-
-    fun setAttemptCount(id: UUID, attemptCount: Int) {
-        jdbc.update("UPDATE payments SET attempt_count = ? WHERE id = ?", attemptCount, id)
-    }
 }

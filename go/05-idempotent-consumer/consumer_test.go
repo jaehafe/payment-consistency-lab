@@ -3,10 +3,12 @@ package idempotentconsumer
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 func Test_naive_consumer__duplicate_message__points_doubled(t *testing.T) {
@@ -95,5 +97,115 @@ func Test_idempotent_consumer__crash_before_offset_commit__redelivery_is_skipped
 	}
 	if o, ok := offsets.Lookup(f.topic, 0); !ok || o.At != 1 {
 		t.Fatalf("커밋된 offset 1 기대: %+v (ok=%v)", o, ok)
+	}
+}
+
+// flakyHandler 는 특정 message_id 처리를 일부러 실패시킨다 (fail 이 켜져 있는 동안).
+// DB 일시 장애처럼 "지금은 실패하지만 나중엔 성공하는" 메시지를 흉내 낸다.
+type flakyHandler struct {
+	inner  MessageHandler
+	failID string
+	fail   atomic.Bool
+}
+
+var errInjected = errors.New("handler failure (injected)")
+
+func (h *flakyHandler) Handle(
+	ctx context.Context, rec *kgo.Record,
+) (bool, error) {
+	if h.fail.Load() && header(rec, "message_id") == h.failID {
+		return false, errInjected
+	}
+	return h.inner.Handle(ctx, rec)
+}
+
+// committedOffset 은 그룹이 커밋한 offset (없으면 -1).
+func committedOffset(t *testing.T, cl *kgo.Client, f fixture) int64 {
+	t.Helper()
+	ctx := context.Background()
+	offsets, err := kadm.NewClient(cl).FetchOffsets(ctx, f.group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o, ok := offsets.Lookup(f.topic, 0); ok {
+		return o.At
+	}
+	return -1
+}
+
+func Test_idempotent_consumer__handler_failure__offset_not_committed_past_failed_message(t *testing.T) {
+	f := newFixture(t)
+	f.produce(t, "msg-1", 1) // offset 0: 처리 실패할 메시지
+
+	h := &flakyHandler{
+		inner:  &IdempotentConsumer{DB: testPool, Group: f.group},
+		failID: "msg-1",
+	}
+	h.fail.Store(true)
+	cl := f.newGroupClient(t)
+	defer cl.Close()
+	loop := &ConsumerLoop{Client: cl, Handler: h}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// 1) msg-1 처리 실패 → PollOnce 가 에러를 돌려준다
+	for {
+		_, err := loop.PollOnce(ctx)
+		if errors.Is(err, errInjected) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 2) 그 뒤에 정상 메시지가 도착하고, "같은 클라이언트"로 계속 poll 한다
+	//    (Run 루프가 하는 일). 실패한 msg-1 을 건너뛰고 msg-2 만 처리한 뒤
+	//    offset 2 를 커밋하면 msg-1 은 영영 다시 오지 않는다 = 유실.
+	f.produce(t, "msg-2", 1) // offset 1
+	stats, err := loop.PollOnce(ctx)
+	t.Logf("실패 후 다음 poll: %+v err=%v", stats, err)
+	if at := committedOffset(t, cl, f); at > 0 {
+		t.Fatalf("실패한 offset 0 을 넘어 커밋됐다 (msg-1 유실): %d", at)
+	}
+
+	// 3) 장애가 풀리면 msg-1 부터 다시 받아 둘 다 처리하고 offset 2 커밋
+	h.fail.Store(false)
+	total := pollUntil(t, loop, 2)
+	if total.Processed != 2 {
+		t.Fatalf("msg-1, msg-2 둘 다 처리 기대: %+v", total)
+	}
+	if n := queryInt(t, `SELECT count(*) FROM processed_messages`); n != 2 {
+		t.Fatalf("processed_messages 2행 기대: %d", n)
+	}
+	if at := committedOffset(t, cl, f); at != 2 {
+		t.Fatalf("커밋된 offset 2 기대: %d", at)
+	}
+}
+
+func Test_consumer_loop__missing_message_id_header__fails_with_clear_error(t *testing.T) {
+	f := newFixture(t)
+	f.produce(t, "", 1) // message_id 헤더 없이 발행 (프로듀서 버그 등)
+
+	cl := f.newGroupClient(t)
+	defer cl.Close()
+	h := &IdempotentConsumer{DB: testPool, Group: f.group}
+	loop := &ConsumerLoop{Client: cl, Handler: h}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var err error
+	for err == nil {
+		_, err = loop.PollOnce(ctx)
+	}
+	if !errors.Is(err, ErrMissingMessageID) {
+		t.Fatalf("ErrMissingMessageID 기대: %v", err)
+	}
+	t.Logf("에러 메시지: %v", err)
+	if pts := queryInt(t, `SELECT coalesce(sum(points), 0) FROM point_ledger`); pts != 0 {
+		t.Fatalf("처리하지 않아야 한다: %d", pts)
+	}
+	if at := committedOffset(t, cl, f); at > 0 {
+		t.Fatalf("offset 이 커밋되면 안 된다: %d", at)
 	}
 }

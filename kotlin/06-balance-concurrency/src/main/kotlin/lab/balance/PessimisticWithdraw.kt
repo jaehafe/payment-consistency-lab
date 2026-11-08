@@ -25,6 +25,10 @@ class PessimisticWithdraw(
 
         pause(readWriteDelayMs) // 지연을 넣어도 안전하다: 행 잠금을 쥐고 있으므로 아무도 끼어들 수 없다
 
+        // 상대값(balance - ?)으로 쓴다. Go 버전은 나이브처럼 "읽은 값 - amount" 절대값을 쓴다.
+        // FOR UPDATE를 쥐고 있는 한 둘은 똑같이 안전하다. 차이는 FOR UPDATE를 지웠을 때 드러난다:
+        //   - 여기(상대값): 10건 모두 통과 → 10번 차감 → 잔액 -9,000 (초과 인출, 잔액 = 1,000 - 출금 합계는 성립)
+        //   - Go(절대값):   10건 모두 통과 → 모두 0을 덮어씀 → 잔액 0 (lost update, 합계도 깨짐)
         jdbc.update("UPDATE accounts SET balance = balance - ? WHERE id = ?", amount, accountId)
         accounts.recordWithdrawal(accountId, amount)
         WithdrawResult.SUCCESS

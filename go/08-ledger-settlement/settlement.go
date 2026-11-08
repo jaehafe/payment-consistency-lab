@@ -49,6 +49,11 @@ type Settlement struct {
 // SettlementService 는 일 정산, PG 입금, 가맹점 지급을 처리한다.
 type SettlementService struct {
 	DB *pgxpool.Pool
+
+	// afterAggregate 는 테스트 전용 훅: 집계 직후, settlement_id 를
+	// 찍기 전에 불린다. 그 사이에 늦은 거래가 커밋되는 경쟁을
+	// 결정적으로 재현하려고 둔다. 운영에서는 nil.
+	afterAggregate func()
 }
 
 // Settle 은 KST 거래일의 미정산 거래를 가맹점별로 집계해 settlements 를 만든다.
@@ -64,25 +69,39 @@ func (s *SettlementService) Settle(ctx context.Context, date time.Time) ([]Settl
 	}
 	defer tx.Rollback(ctx)
 
-	// 1) 대상 거래를 잠근다. 정산이 동시에 두 번 돌아도 같은 거래를 두 번 집계하지 않게.
-	if _, err := tx.Exec(ctx, `
-		SELECT id FROM transactions
-		 WHERE occurred_at >= $1 AND occurred_at < $2 AND settlement_id IS NULL
-		   FOR UPDATE`, start, end); err != nil {
+	// 1) 대상 거래를 잠그고 그 ID 를 받아 둔다.
+	//    정산이 동시에 두 번 돌아도 같은 거래를 두 번 집계하지 않게.
+	rows, err := tx.Query(ctx, `
+		SELECT id::text FROM transactions
+		 WHERE occurred_at >= $1 AND occurred_at < $2
+		   AND settlement_id IS NULL
+		   FOR UPDATE`, start, end)
+	if err != nil {
+		return nil, err
+	}
+	// RowTo[string]: 한 컬럼짜리 행을 string 으로
+	// (Kotlin 의 { rs, _ -> rs.getString(1) })
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
 		return nil, err
 	}
 
-	// 2) 가맹점별 집계. FILTER (WHERE ...) 는 조건부 합계 (SUM(CASE WHEN ...) 의 깔끔한 버전).
-	rows, err := tx.Query(ctx, `
+	// 2) 가맹점별 집계 — 날짜 범위로 다시 찾지 않고 "잠근 ID" 만 본다.
+	//    READ COMMITTED 에서는 문장마다 새 스냅샷이라, 범위로 다시 찾으면
+	//    1) 이후 커밋된 늦은 거래가 잠기지 않은 채 끼어든다.
+	//    = ANY($1) 는 "배열 중 하나와 같으면" (Kotlin 의 id in ids).
+	//    Go 슬라이스를 그대로 넘기면 pgx 가 배열로 보낸다.
+	//    FILTER (WHERE ...) 는 조건부 합계 (SUM(CASE WHEN ...) 의 깔끔한 버전).
+	rows, err = tx.Query(ctx, `
 		SELECT merchant_id,
 		       coalesce(sum(amount) FILTER (WHERE type = 'PAYMENT'), 0) AS gross,
 		       coalesce(sum(amount) FILTER (WHERE type = 'REFUND'), 0)  AS refund,
 		       coalesce(sum(fee) FILTER (WHERE type = 'PAYMENT'), 0)
 		     - coalesce(sum(fee) FILTER (WHERE type = 'REFUND'), 0)     AS net_fee
 		  FROM transactions
-		 WHERE occurred_at >= $1 AND occurred_at < $2 AND settlement_id IS NULL
+		 WHERE id = ANY($1::uuid[])
 		 GROUP BY merchant_id
-		 ORDER BY merchant_id`, start, end)
+		 ORDER BY merchant_id`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +113,9 @@ func (s *SettlementService) Settle(ctx context.Context, date time.Time) ([]Settl
 	})
 	if err != nil {
 		return nil, err
+	}
+	if s.afterAggregate != nil {
+		s.afterAggregate()
 	}
 
 	var created []Settlement
@@ -110,11 +132,13 @@ func (s *SettlementService) Settle(ctx context.Context, date time.Time) ([]Settl
 		if tag.RowsAffected() == 0 {
 			continue // 이 가맹점/날짜는 이미 정산됨 (늦게 들어온 거래는 README 의 한계 참고)
 		}
-		// 3) 거래에 정산 ID 를 찍어 "정산 완료" 표시
+		// 3) 거래에 정산 ID 를 찍어 "정산 완료" 표시.
+		//    여기도 잠근(= 집계한) ID 로만. 날짜 범위로 찍으면 집계 후 커밋된
+		//    늦은 거래가 "금액엔 없는데 정산됨" 으로 표시돼 영영 정산되지 않는다.
 		if _, err := tx.Exec(ctx, `
 			UPDATE transactions SET settlement_id = $1
-			 WHERE merchant_id = $2 AND occurred_at >= $3 AND occurred_at < $4 AND settlement_id IS NULL`,
-			st.ID, st.MerchantID, start, end); err != nil {
+			 WHERE id = ANY($2::uuid[]) AND merchant_id = $3`,
+			st.ID, ids, st.MerchantID); err != nil {
 			return nil, err
 		}
 		created = append(created, st)

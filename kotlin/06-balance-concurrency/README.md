@@ -31,9 +31,9 @@ READ COMMITTED의 SELECT는 잠금을 걸지 않으므로 "읽기 → 검사 →
 ## 핵심 코드 위치
 
 - `src/main/kotlin/lab/balance/NaiveWithdraw.kt:23` — 읽기(`:24`) → 주입 지연(`:27`) → 절대값 쓰기(`:30`)
-- `src/main/kotlin/lab/balance/PessimisticWithdraw.kt:22` — `FOR UPDATE`
-- `src/main/kotlin/lab/balance/OptimisticWithdraw.kt:41` — version CAS, `:44` 0행이면 재시도
-- `src/main/kotlin/lab/balance/SerializableWithdraw.kt:24` — 격리 수준, `:46` 40001만 재시도
+- `src/main/kotlin/lab/balance/PessimisticWithdraw.kt:22` — `FOR UPDATE`, `:28` 상대값 UPDATE (Go와의 차이)
+- `src/main/kotlin/lab/balance/OptimisticWithdraw.kt:42` — version CAS, `:45` 0행이면 재시도, `:22` `maxAttempts`(첫 시도 포함 총 시도 횟수)
+- `src/main/kotlin/lab/balance/SerializableWithdraw.kt:24` — 격리 수준, `:47` 40001만 재시도
 - `src/main/kotlin/lab/balance/ConditionalUpdateWithdraw.kt:24` — 조건부 UPDATE 한 문장
 - `src/main/kotlin/lab/balance/TransferService.kt:27` — id 정렬 잠금 / `:35` 정렬 안 한 버전(데드락)
 - `src/test/kotlin/lab/balance/Concurrency.kt` — 시작 래치로 스레드를 한꺼번에 출발시키는 헬퍼
@@ -46,17 +46,22 @@ cd kotlin
 ```
 
 레이스를 **결정적으로** 재현하기 위해: 시작 래치로 10개 스레드를 동시에 출발시키고, 전략에 "읽기와 쓰기 사이 지연"(`readWriteDelayMs`)을 주입한다.
-지연 동안 나머지 9건이 모두 읽기를 마치므로 매번 같은 결과가 나온다. 커넥션 풀은 30개(`application.yml`) — 풀이 작으면 요청이 커넥션 대기로 직렬화돼 레이스가 가려진다.
+지연 동안 나머지 9건이 모두 읽기를 마치므로 매번 같은 결과가 나온다 — 그래서 아래 숫자(10건, 9회)는 테스트가 `==`로 단언한다. 커넥션 풀은 30개(`application.yml`) — 풀이 작으면 요청이 커넥션 대기로 직렬화돼 레이스가 가려진다.
 
 | 테스트 | 증명하는 것 |
 |---|---|
-| `naive__concurrent_withdrawals__double_spending` | 10건 모두 성공, 잔액 0 ≠ 1,000 - 출금 합계 10,000 |
+| `naive__concurrent_withdrawals__double_spending` | 10건 모두 성공, 출금 합계 10,000, 잔액 0 ≠ 1,000 - 10,000 |
 | `pessimistic__concurrent_withdrawals__exactly_one_succeeds` | 지연을 넣어도 1건만 성공 |
-| `optimistic__concurrent_withdrawals__exactly_one_succeeds_with_retries` | 1건 성공, 버전 충돌 재시도 9회 |
-| `serializable__concurrent_withdrawals__exactly_one_succeeds_with_retries` | **나이브와 같은 코드**인데 격리 수준만으로 1건 성공, 40001 재시도 9회 |
+| `optimistic__concurrent_withdrawals__exactly_one_succeeds_with_retries` | 1건 성공, 버전 충돌 재시도 정확히 9회 (9건이 1번씩) |
+| `serializable__concurrent_withdrawals__exactly_one_succeeds_with_retries` | **나이브와 같은 코드**인데 격리 수준만으로 1건 성공, 40001 재시도 정확히 9회 |
 | `conditional_update__concurrent_withdrawals__exactly_one_succeeds` | 지연 주입 지점 자체가 없다 (틈이 없음) |
 | `transfer__opposite_directions_concurrently__no_deadlock` | A→B 10건 + B→A 10건 동시, 잠금 사이 지연이 있어도 데드락 없음, 총액 보존 |
 | `transfer__unordered_locking__deadlock_detected` | 정렬 안 하면 Postgres가 1초(deadlock_timeout) 뒤 한쪽을 **SQLSTATE 40P01**로 죽임 |
+
+### Go 구현과의 차이
+
+- **재시도 한도**: `maxAttempts`는 첫 시도를 **포함한** 총 시도 횟수다 (20 = 첫 시도 + 재시도 최대 19). Go의 `MaxAttempts`도 같은 의미.
+- **Pessimistic의 UPDATE**: 여기는 `balance = balance - ?`(상대값), Go는 나이브처럼 `balance = <읽은 값 - amount>`(절대값). `FOR UPDATE`가 있으면 둘 다 안전하다. `FOR UPDATE`를 지워 보면 차이가 보인다: Kotlin은 10건 성공·잔액 **-9,000**(초과 인출, 하지만 잔액 = 1,000 - 출금 합계는 성립), Go는 10건 성공·잔액 **0**(lost update, 합계도 깨짐).
 
 ## 한계 / 다음 단계
 

@@ -69,6 +69,10 @@ docker compose -f ../infra/docker-compose.yml exec redpanda \
 3)은 `../infra/debezium/register.sh`로 대신할 수 있다 (jq 필요).
 (커넥터는 등록 시점에 스냅샷을 찍으므로 등록 전에 만든 결제도 함께 발행된다)
 
+> 같은 compose DB를 03과 함께 쓴다. 03(Kotlin)은 `outbox_polling`, Go 03은 `go_03.outbox`를 쓰므로 `public.outbox`는 이 단계 전용이다.
+> 예전 버전의 Kotlin 03(테이블 이름이 `outbox`였음)을 이 DB에 돌린 적이 있다면 2) 전에 `DROP TABLE outbox;` 할 것 —
+> 남아 있으면 `CREATE TABLE IF NOT EXISTS`가 그 테이블을 그대로 두어 insert가 `column "aggregatetype" does not exist`로 실패한다.
+
 ## Polling vs CDC 트레이드오프
 
 | | Polling (03) | CDC (04) |

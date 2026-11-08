@@ -18,7 +18,7 @@ class OutboxRepository(private val jdbc: JdbcTemplate) {
 
     fun insert(m: OutboxMessage) {
         jdbc.update(
-            "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload) VALUES (?, ?, ?, ?, ?::jsonb)",
+            "INSERT INTO outbox_polling (id, aggregate_type, aggregate_id, event_type, payload) VALUES (?, ?, ?, ?, ?::jsonb)",
             m.id, m.aggregateType, m.aggregateId, m.eventType, m.payload,
         )
     }
@@ -36,7 +36,7 @@ class OutboxRepository(private val jdbc: JdbcTemplate) {
         jdbc.query(
             """
             SELECT id, aggregate_type, aggregate_id, event_type, payload::text AS payload
-            FROM outbox
+            FROM outbox_polling
             WHERE published_at IS NULL
             ORDER BY created_at
             LIMIT ?
@@ -56,9 +56,9 @@ class OutboxRepository(private val jdbc: JdbcTemplate) {
 
     fun markPublished(ids: List<UUID>) {
         if (ids.isEmpty()) return
-        jdbc.batchUpdate("UPDATE outbox SET published_at = now() WHERE id = ?", ids.map { arrayOf<Any>(it) })
+        jdbc.batchUpdate("UPDATE outbox_polling SET published_at = now() WHERE id = ?", ids.map { arrayOf<Any>(it) })
     }
 
     fun countUnpublished(): Int =
-        jdbc.queryForObject("SELECT count(*) FROM outbox WHERE published_at IS NULL", Int::class.java)!!
+        jdbc.queryForObject("SELECT count(*) FROM outbox_polling WHERE published_at IS NULL", Int::class.java)!!
 }

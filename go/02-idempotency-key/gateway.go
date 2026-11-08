@@ -26,9 +26,10 @@ type FakePaymentGateway struct {
 	TimeoutAfterCharge atomic.Bool // 승인은 됐는데 응답이 유실 → 호출자는 타임아웃만 봄
 	ChargeDelay        time.Duration
 
-	mu      sync.Mutex // byKey, charged 를 보호하는 잠금
+	mu      sync.Mutex // byKey, charged, calls 를 보호하는 잠금
 	byKey   map[string]string
-	charged int
+	charged int // 실제 승인 횟수 (돈이 빠진 횟수)
+	calls   int // Charge 호출 횟수 (멱등 재응답·실패 포함)
 }
 
 func NewFakePaymentGateway() *FakePaymentGateway {
@@ -38,6 +39,11 @@ func NewFakePaymentGateway() *FakePaymentGateway {
 // Charge 는 결제를 승인한다. 반환값은 (pgTxId, error) 두 개.
 // (g *FakePaymentGateway) 는 리시버: 이 함수가 FakePaymentGateway 의 메서드이고 g 가 Kotlin의 this 라는 뜻.
 func (g *FakePaymentGateway) Charge(ctx context.Context, idempotencyKey, orderID string, amount int64) (string, error) {
+	// 호출 횟수는 성공/실패와 무관하게 센다 (Kotlin callCount 와 같은 의미).
+	g.mu.Lock()
+	g.calls++
+	g.mu.Unlock()
+
 	if g.FailBeforeCharge.Load() {
 		return "", ErrPGFailed
 	}
@@ -73,4 +79,14 @@ func (g *FakePaymentGateway) ChargeCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock() // defer: 함수가 끝날 때 실행 (try-finally 의 finally)
 	return g.charged
+}
+
+// CallCount 는 Charge 가 호출된 횟수 (테스트 검증용).
+// ChargeCount 와 함께 보면 "누가 이중 결제를 막았나"를 구분할 수 있다:
+//   - call=1, charge=1 → 우리 서버(Phase 1 잠금/저장된 응답)가 막았다
+//   - call=2, charge=1 → 우리는 PG 를 두 번 불렀고 PG 멱등성이 막았다
+func (g *FakePaymentGateway) CallCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
 }

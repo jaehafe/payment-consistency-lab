@@ -2,7 +2,6 @@ package lab.balance
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
-import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
@@ -36,7 +35,10 @@ class BalanceConcurrencyTest {
 
         val successes = results.count { it == WithdrawResult.SUCCESS }
         println("naive: 성공 $successes 건, 잔액 ${accounts.balanceOf(account)}, 출금 합계 ${accounts.withdrawnSum(account)}")
-        assertTrue(successes > 1, "1,000원짜리 계좌에서 여러 번 출금이 성공했다 = 이중 지불 (성공 $successes 건)")
+        // 300ms 틈 동안 10건이 모두 1,000을 읽은 뒤에야 첫 쓰기가 일어나므로 결과가 결정적이다.
+        assertEquals(requests, successes, "1,000원짜리 계좌에서 10건 모두 출금 성공 = 이중 지불")
+        assertEquals(10_000, accounts.withdrawnSum(account), "실제로 10,000원이 나갔다")
+        assertEquals(0, accounts.balanceOf(account), "각자 '1,000 - 1,000 = 0'을 덮어써서 잔액은 0")
         assertNotEquals(
             1_000 - accounts.withdrawnSum(account), accounts.balanceOf(account),
             "잔액 ≠ 초기 잔액 - 출금 합계: 갱신이 서로를 덮어썼다 (lost update)",
@@ -64,7 +66,8 @@ class BalanceConcurrencyTest {
         assertExactlyOneSucceeded(account, results)
         val retries = optimistic.retries.get() - retriesBefore
         println("optimistic: 버전 충돌 재시도 $retries 회")
-        assertTrue(retries > 0, "version 충돌로 재시도가 실제로 일어났다")
+        // 10건 모두 version 0을 읽음 → 1건만 CAS 성공 → 나머지 9건은 0행 → 1번씩 재시도 → 잔액 0을 읽고 INSUFFICIENT
+        assertEquals(requests - 1, retries, "충돌한 9건이 1번씩 재시도")
     }
 
     @Test
@@ -78,7 +81,8 @@ class BalanceConcurrencyTest {
         assertExactlyOneSucceeded(account, results)
         val retries = serializable.retries.get() - retriesBefore
         println("serializable: 40001 재시도 $retries 회")
-        assertTrue(retries > 0, "SQLSTATE 40001(serialization_failure)로 재시도가 실제로 일어났다")
+        // 승자가 커밋하면 나머지 9건의 UPDATE가 40001 → 1번씩 재시도 → 잔액 0을 읽고 INSUFFICIENT
+        assertEquals(requests - 1, retries, "SQLSTATE 40001(serialization_failure)로 9건이 1번씩 재시도")
     }
 
     @Test

@@ -93,10 +93,16 @@ func Test_naive__concurrent_withdrawals__double_spending(t *testing.T) {
 	withdrawn := queryInt(t, `SELECT coalesce(sum(amount), 0) FROM withdrawals`)
 	t.Logf("성공 %d건, 실제 인출 합계 %d원, 남은 잔액 %d원 (1,000원 계좌!)", successes, withdrawn, balance)
 
-	if successes <= 1 {
-		t.Fatalf("이중 지불이 재현돼야 한다 (성공 > 1): %d", successes)
+	// raceGap(200ms) 동안 10건이 모두 "1,000" 을 읽고 나서야 첫 쓰기가 일어나므로
+	// 결과가 결정적이다: 10건 모두 성공, 각자 0 을 덮어써서 잔액 0.
+	if successes != concurrency {
+		t.Fatalf("10건 모두 성공해야 한다 (이중 지불): %d", successes)
 	}
-	// 돈의 보존 법칙이 깨졌다: 초기 잔액 - 인출 합계 ≠ 현재 잔액
+	if withdrawn != concurrency*withdrawAmount || balance != 0 {
+		t.Fatalf("인출 10,000 / 잔액 0 기대: withdrawn=%d balance=%d",
+			withdrawn, balance)
+	}
+	// 돈의 보존 법칙이 깨졌다: 초기 잔액 - 인출 합계(-9,000) ≠ 현재 잔액(0)
 	if initialBalance-withdrawn == balance {
 		t.Fatalf("잔액과 인출 합계가 불일치해야 한다: balance=%d withdrawn=%d", balance, withdrawn)
 	}
@@ -108,25 +114,33 @@ func Test_pessimistic__concurrent_withdrawals__exactly_one_succeeds(t *testing.T
 }
 
 func Test_optimistic__concurrent_withdrawals__exactly_one_succeeds_with_retries(t *testing.T) {
-	w := &OptimisticWithdraw{DB: testPool, MaxRetries: 5, ReadWriteDelay: raceGap}
+	w := &OptimisticWithdraw{
+		DB: testPool, MaxAttempts: 5, ReadWriteDelay: raceGap,
+	}
 	s, i := runWithdrawScenario(t, w)
 	assertExactlyOne(t, s, i)
 
-	// 모두 version 0 을 읽었으므로 1명만 이기고 나머지 9명은 0행 갱신 → 재시도 → 잔액 0 을 읽고 "부족"
+	// 모두 version 0 을 읽었으므로 1명만 이기고 나머지 9명은 0행 갱신
+	// → 재시도 1번 → 잔액 0 을 읽고 "부족". 그래서 재시도는 정확히 9회.
 	t.Logf("재시도 %d회", w.Retries.Load())
-	if w.Retries.Load() < concurrency-1 {
-		t.Fatalf("충돌한 %d건은 재시도해야 한다: %d", concurrency-1, w.Retries.Load())
+	if w.Retries.Load() != concurrency-1 {
+		t.Fatalf("충돌한 %d건이 1번씩 재시도해야 한다: %d",
+			concurrency-1, w.Retries.Load())
 	}
 }
 
 func Test_serializable__concurrent_withdrawals__exactly_one_succeeds_with_retries(t *testing.T) {
-	w := &SerializableWithdraw{DB: testPool, MaxRetries: 5, ReadWriteDelay: raceGap}
+	w := &SerializableWithdraw{
+		DB: testPool, MaxAttempts: 5, ReadWriteDelay: raceGap,
+	}
 	s, i := runWithdrawScenario(t, w)
 	assertExactlyOne(t, s, i)
 
+	// 승자가 커밋하면 나머지 9건의 UPDATE 가 40001 → 재시도 1번 → 잔액 0 → "부족".
 	t.Logf("40001 로 인한 재시도 %d회", w.Retries.Load())
-	if w.Retries.Load() < concurrency-1 {
-		t.Fatalf("충돌한 %d건은 40001 후 재시도해야 한다: %d", concurrency-1, w.Retries.Load())
+	if w.Retries.Load() != concurrency-1 {
+		t.Fatalf("충돌한 %d건이 40001 후 1번씩 재시도해야 한다: %d",
+			concurrency-1, w.Retries.Load())
 	}
 }
 

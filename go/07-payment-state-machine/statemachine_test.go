@@ -192,6 +192,10 @@ func Test_pg_timeout_before_charge__unknown__janitor_marks_failed(t *testing.T) 
 	if stats.Rescheduled != 1 || f.mustGet(t, p.ID).Status != Unknown {
 		t.Fatalf("grace 기간 내 NOT_FOUND 는 보류: %+v", stats)
 	}
+	// 보류는 "실패한 확인"이 아니므로 시도 횟수를 쓰지 않는다
+	if n := f.mustGet(t, p.ID).AttemptCount; n != 0 {
+		t.Fatalf("grace 내 NOT_FOUND 는 attempt 를 안 쓴다: %d", n)
+	}
 
 	// 2회차 (10분 뒤): 여전히 NOT_FOUND → 요청이 도달하지 않은 것으로 확정 → FAILED
 	stats, err = f.janitor.ReconcileUnknown(ctx, time.Now().Add(10*time.Minute))
@@ -289,9 +293,21 @@ func Test_cancel_failure__left_cancel_requested__janitor_retries_cancel(t *testi
 	if p.Status != CancelRequested || f.gateway.IsCanceled(p.PgTxID) {
 		t.Fatalf("CANCEL_REQUESTED 로 남고 PG 는 아직 승인 상태: %+v", p)
 	}
+	if p.AttemptCount != 1 {
+		t.Fatalf("보상 중 취소 실패도 1회 시도로 센다: %d", p.AttemptCount)
+	}
+
+	// 백오프 전에는 집어 가지 않는다 (next_retry_at = 지금 + 지연)
+	stats, err := f.janitor.RetryCancels(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats != (JanitorStats{}) {
+		t.Fatalf("백오프 전에는 재시도하지 않는다: %+v", stats)
+	}
 
 	// 취소 API 가 아직 장애 → janitor 재시도도 실패, 백오프 후 재예약
-	stats, err := f.janitor.RetryCancels(ctx, time.Now().Add(time.Second))
+	stats, err = f.janitor.RetryCancels(ctx, time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,11 +317,84 @@ func Test_cancel_failure__left_cancel_requested__janitor_retries_cancel(t *testi
 
 	// 장애 복구 후 janitor 가 다시 시도 → CANCELED
 	f.gateway.FailCancel.Store(false)
-	stats, err = f.janitor.RetryCancels(ctx, time.Now().Add(time.Hour))
+	stats, err = f.janitor.RetryCancels(ctx, time.Now().Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stats.Canceled != 1 || f.mustGet(t, p.ID).Status != Canceled || !f.gateway.IsCanceled(p.PgTxID) {
 		t.Fatalf("janitor 재시도로 취소 완료돼야 한다: %+v", stats)
+	}
+}
+
+// grace 안의 NOT_FOUND 가 시도 횟수를 잡아먹으면 안 된다.
+// 백오프 합(1분+2분)이 grace(5분)보다 짧아서, 예전에는 grace 가
+// 끝나기 전에 MaxAttempts 에 걸려 MANUAL_REVIEW 로 갔다.
+// janitor 가 "예약된 시각마다" 돈다고 보고 시계를 그대로 따라간다.
+func Test_not_found_within_grace__does_not_consume_attempts__ends_failed(
+	t *testing.T,
+) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	f.gateway.TimeoutBeforeCharge.Store(true) // PG 미도달
+	p, err := f.svc.Pay(ctx, "order-1", 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 10; i++ { // 무한 루프 방지용 상한
+		var next time.Time
+		err := testPool.QueryRow(ctx,
+			`SELECT next_retry_at FROM payments WHERE id = $1`,
+			p.ID).Scan(&next)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 예약된 시각 그대로 janitor 실행 (시간을 더 얹지 않는다)
+		if _, err := f.janitor.ReconcileUnknown(ctx, next); err != nil {
+			t.Fatal(err)
+		}
+		if f.mustGet(t, p.ID).Status != Unknown {
+			break
+		}
+	}
+	got := f.mustGet(t, p.ID)
+	if got.Status != Failed {
+		t.Fatalf("grace 후 NOT_FOUND → FAILED 기대: %s (attempts=%d)",
+			got.Status, got.AttemptCount)
+	}
+	// grace 안의 확인은 세지 않고, grace 후 확정한 1회만 센다
+	if got.AttemptCount != 1 {
+		t.Fatalf("grace 후 확정 1회만 센다: %d", got.AttemptCount)
+	}
+}
+
+// 시도 횟수가 아무리 커져도 백오프가 오버플로(0 이하)되면 안 된다.
+// 1분 << 40 같은 값은 int64 를 넘는다 → 지수에 상한(20)을 둔다.
+func Test_backoff__large_attempt__capped_without_overflow(t *testing.T) {
+	j := &Janitor{BaseBackoff: time.Minute}
+	prev := time.Duration(0)
+	for attempt := 1; attempt <= 100; attempt++ {
+		d := j.backoff(attempt)
+		if d <= 0 || d < prev {
+			t.Fatalf("attempt=%d: 백오프 %v (이전 %v)", attempt, d, prev)
+		}
+		prev = d
+	}
+	if want := time.Minute << 20; prev != want {
+		t.Fatalf("상한 %v 기대: %v", want, prev)
+	}
+}
+
+// Base 가 크면(24시간) << 20 만으로도 넘친다 → 최댓값에서 멈춰야 한다.
+func Test_backoff__huge_base__saturates_without_overflow(t *testing.T) {
+	j := &Janitor{BaseBackoff: 24 * time.Hour}
+	prev := time.Duration(0)
+	for attempt := 1; attempt <= 30; attempt++ {
+		d := j.backoff(attempt)
+		if d <= 0 || d < prev {
+			t.Fatalf("attempt=%d: 백오프 %v (이전 %v)", attempt, d, prev)
+		}
+		prev = d
 	}
 }

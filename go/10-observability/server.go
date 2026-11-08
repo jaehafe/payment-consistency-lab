@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,14 +16,29 @@ import (
 //	POST /payments   결제 (헤더 Idempotency-Key 필수, X-Request-Id 선택)
 //	GET  /metrics    Prometheus 스크레이프 엔드포인트
 func NewServer(svc *PaymentService, logger *slog.Logger) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /payments", func(w http.ResponseWriter, r *http.Request) {
-		handlePay(svc, w, r)
-	})
-	// 전용 레지스트리의 메트릭만 노출한다 (promhttp.Handler() 는 전역 레지스트리용).
-	mux.Handle("GET /metrics", promhttp.HandlerFor(svc.Metrics.Registry, promhttp.HandlerOpts{}))
-	return RequestLogging(logger, mux)
+	return RequestLogging(logger, Routes(svc))
 }
+
+// Routes 는 미들웨어 없이 라우팅만 한 mux 를 돌려준다.
+// cmd/main.go 처럼 다른 경로(/admin/faults)를 더 붙인 뒤
+// 전체를 RequestLogging 으로 한 번 감쌀 때 쓴다.
+func Routes(svc *PaymentService) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /payments",
+		func(w http.ResponseWriter, r *http.Request) {
+			handlePay(svc, w, r)
+		})
+	// 전용 레지스트리의 메트릭만 노출한다
+	// (promhttp.Handler() 는 전역 레지스트리용).
+	mux.Handle("GET /metrics", promhttp.HandlerFor(
+		svc.Metrics.Registry, promhttp.HandlerOpts{}))
+	return mux
+}
+
+// safeRequestID 는 받아들일 X-Request-Id 모양 (Kotlin RequestIdFilter 와 같은 규칙).
+// 헤더 값을 그대로 로그 필드에 넣으므로, 따옴표/공백/개행이 든 값이나
+// 아주 긴 값은 버리고 새로 만든다 (로그 인젝션, 로그 폭탄 방지).
+var safeRequestID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 // RequestLogging 은 미들웨어다: 요청 앞뒤로 공통 처리를 끼워 넣는다 (Spring의 OncePerRequestFilter / HandlerInterceptor).
 //
@@ -31,8 +47,9 @@ func NewServer(svc *PaymentService, logger *slog.Logger) http.Handler {
 func RequestLogging(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := r.Header.Get("X-Request-Id")
-		if requestID == "" {
-			requestID = uuid.NewString() // 클라이언트/게이트웨이가 안 줬으면 여기서 만든다
+		// 안 줬거나 모양이 이상하면 여기서 만든다
+		if !safeRequestID.MatchString(requestID) {
+			requestID = uuid.NewString()
 		}
 		// 이 ctx 를 r.WithContext 로 요청에 실어 보내면, 핸들러 → 서비스 → 로그까지 request_id 가 따라간다.
 		ctx := AddLogAttrs(r.Context(), slog.String("request_id", requestID))

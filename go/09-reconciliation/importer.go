@@ -11,6 +11,7 @@ import (
 	"io"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,11 +37,16 @@ type Importer struct {
 //
 // 왜 해시인가? PG 가 같은 파일을 재전송하거나, 배치가 재시도되면 같은 파일이 두 번 들어온다.
 // 파일 이름은 바뀔 수 있으므로 "내용"의 SHA-256 으로 판단한다.
+// 단, 원본 바이트가 아니라 정규화한 내용(normalizeCSV)의 해시다.
 func (im *Importer) Import(ctx context.Context, fileName string, content []byte) (ImportResult, error) {
-	sum := sha256.Sum256(content)
-	hash := hex.EncodeToString(sum[:])
+	// 엑셀이 붙이는 UTF-8 BOM 은 해시/파싱 모두에서 뗀다
+	content = bytes.TrimPrefix(content, []byte("\xEF\xBB\xBF"))
+	// 해시와 파싱이 같은 입력을 보게 한다 (Kotlin 도 같다)
+	normalized := normalizeCSV(content)
+	sum := sha256.Sum256([]byte(normalized))
+	hash := hex.EncodeToString(sum[:]) // [32]byte → 16진수 문자열
 
-	records, err := parseCSV(content)
+	records, err := parseCSV([]byte(normalized))
 	if err != nil {
 		return ImportResult{}, fmt.Errorf("%s: %w", fileName, err)
 	}
@@ -79,6 +85,28 @@ func (im *Importer) Import(ctx context.Context, fileName string, content []byte)
 		return ImportResult{}, err
 	}
 	return ImportResult{FileID: fileID, Rows: len(records)}, nil
+}
+
+// normalizeCSV 는 의미 없는 차이를 지운 텍스트를 만든다.
+// 같은 파일이 CRLF 로 다시 저장되거나 끝 개행이 하나 더 붙어 오면
+// 원본 바이트 해시는 달라져서 "새 파일"로 들어가고,
+// 전 건이 DUPLICATE_IN_PG 가 된다. 그래서 해시 전에:
+//   - CRLF, CR → LF
+//   - 줄 앞뒤 공백 trim
+//   - 빈 줄 제거 → 끝 개행 개수 무관
+//
+// 파싱도 이 결과로 한다 → "해시가 같으면 읽는 데이터도 같다".
+// (Kotlin 의 lines().map { trim() }.filter { isNotEmpty() } 와 같다)
+func normalizeCSV(content []byte) string {
+	s := strings.ReplaceAll(string(content), "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	var lines []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // pgRecord 는 CSV 한 줄.

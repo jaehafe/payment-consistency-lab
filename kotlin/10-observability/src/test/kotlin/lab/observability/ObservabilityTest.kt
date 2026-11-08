@@ -22,7 +22,8 @@ import org.springframework.http.ResponseEntity
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+// PG 타임아웃을 테스트용으로 짧게 (운영 기본값은 application.yml 의 5초)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = ["lab.pg.timeout-ms=500"])
 @Import(TestcontainersConfiguration::class)
 // 스프링 부트 테스트는 기본적으로 메트릭 export(Prometheus 레지스트리)를 끈다 → 실제 /actuator/prometheus를 검증하려고 켠다
 @AutoConfigureObservability
@@ -68,6 +69,8 @@ class ObservabilityTest {
     fun pg_timeout__unknown_counter_and_gauge_increase() {
         val unknownBefore = requestsCount("unknown")
         val gaugeBefore = unknownGauge()
+        val timeoutTimer = { registry.find("pg.call.duration").tag("outcome", "timeout").timer() }
+        val timeoutTotalBefore = timeoutTimer()?.totalTime(TimeUnit.MILLISECONDS) ?: 0.0
         pg.timeoutAfterCharge = true
 
         val response = post(newKey(), newOrderId(), 10_000)
@@ -76,6 +79,9 @@ class ObservabilityTest {
         assertEquals("UNKNOWN", json(response.body)["status"].asText())
         assertEquals(unknownBefore + 1, requestsCount("unknown"), "payment_requests_total{result=\"unknown\"} +1")
         assertEquals(gaugeBefore + 1, unknownGauge(), "payment_unknown_current +1 (DB의 UNKNOWN 건수)")
+        // 타임아웃은 "즉시 실패"가 아니라 설정된 타임아웃(500ms)만큼 기다린 뒤에 난다 → PgLatencyHigh(p99)에 잡힌다
+        val waited = timeoutTimer()!!.totalTime(TimeUnit.MILLISECONDS) - timeoutTotalBefore
+        assertTrue(waited >= 500.0, "타임아웃 호출 시간이 타임아웃 설정 이상: ${waited}ms")
     }
 
     @Test

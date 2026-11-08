@@ -27,3 +27,8 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+
+lab:
+  pg:
+    # PG 응답 타임아웃(Fake PG가 흉내 냄). 이보다 늦으면 UNKNOWN. PgLatencyHigh 임계값(3s)보다 커야 타임아웃 급증 때 p99 알림도 뜬다.
+    timeout-ms: 5000
